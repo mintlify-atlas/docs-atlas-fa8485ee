@@ -1,0 +1,230 @@
+---
+title: "RepoAnalyzer: AST Dependency Graph and Context Extraction"
+sidebarTitle: "Repo Analyzer"
+description: "RepoAnalyzer maps Python AST import graphs repo-wide and uses BFS to give the Healer agent focused, dependency-aware context for each failing file."
+---
+
+`RepoAnalyzer` gives the healing pipeline structural awareness of the repository it is working on. Rather than sending every file in the repo to the Healer AI agent, the class uses Python's built-in `ast` module to map inter-file imports and then performs a breadth-first traversal starting from the failing file to collect only the most relevant context — keeping prompts focused and token-efficient.
+
+## Class: `RepoAnalyzer`
+
+```python
+from app.services.repo_analyzer import RepoAnalyzer
+
+analyzer = RepoAnalyzer()
+```
+
+The class is stateless and requires no constructor arguments. All methods accept path arguments and return data structures rather than mutating internal state, so a single instance can safely be shared across concurrent pipeline calls.
+
+---
+
+## Methods
+
+### `scan_python_dependencies()`
+
+Parses a single Python source file using the standard-library `ast` module and returns the set of all imported names. This is the atomic building block of the dependency graph.
+
+```python
+def scan_python_dependencies(self, file_path: Path) -> set[str]
+```
+
+<ParamField path="file_path" type="Path" required>
+  Absolute or relative path to the `.py` file to analyse. Returns an empty set without raising if the file does not exist, contains a syntax error, or cannot be decoded.
+</ParamField>
+
+**Returns:** `set[str]` — every imported name and module path encountered in the file, including:
+
+- Simple imports: `import os` → `{"os"}`
+- From-imports with module: `from app.models import schemas` → `{"app.models", "app.models.schemas", "schemas"}`
+- Star imports are ignored; only non-`*` alias names are included.
+
+**Internal implementation:** iterates `ast.walk(tree)` and handles two node types:
+
+- `ast.Import` — adds each `alias.name` directly.
+- `ast.ImportFrom` — adds the module (`node.module`), each alias name, and `module.alias_name` combined forms.
+
+```python
+from pathlib import Path
+from app.services.repo_analyzer import RepoAnalyzer
+
+analyzer = RepoAnalyzer()
+deps = analyzer.scan_python_dependencies(Path("app/services/orchestrator.py"))
+# {"app.services.llm_client", "call_gemini", "app.models.schemas", "HealRequest", ...}
+```
+
+<Note>
+  Files that fail to parse (syntax errors, encoding issues) silently return an empty set — a `DEBUG`-level log entry is emitted but no exception propagates. This keeps graph construction resilient to partially-broken repos.
+</Note>
+
+---
+
+### `build_dependency_graph()`
+
+Recursively scans every Python file in `repo_dir`, calls `scan_python_dependencies()` on each, and resolves raw import strings to concrete repo-relative file paths. The result is a directed adjacency list representing the full inter-file import graph.
+
+```python
+def build_dependency_graph(
+    self,
+    repo_dir: Path,
+    language: str = "python",
+) -> dict[str, list[str]]
+```
+
+<ParamField path="repo_dir" type="Path" required>
+  Root directory of the repository to analyse.
+</ParamField>
+
+<ParamField path="language" type="str" default="python">
+  Reserved for future multi-language support. Currently only `"python"` is processed; the method always uses `rglob("*.py")` regardless of this value.
+</ParamField>
+
+**Returns:** `dict[str, list[str]]` — keys are repo-relative POSIX paths (`"app/services/orchestrator.py"`), values are sorted lists of repo-relative paths of files that the key file imports.
+
+#### Ignored Directories
+
+Files inside any of the following directory names are excluded from the graph:
+
+```text
+.git  .pytest_cache  __pycache__  venv  .venv  build  dist  node_modules
+```
+
+#### Import Resolution Strategy
+
+For each raw import string the method tries three resolution approaches in order:
+
+1. **Module dot-notation match** — converts the file path to a dotted module name (`app/services/orchestrator.py` → `app.services.orchestrator`) and checks for an exact match or a suffix match (`.dep`).
+2. **Stem match** — strips the extension and looks for any file whose stem equals the imported name.
+3. **Path conversion** — replaces `.` with `/` and appends `.py` to try a direct path lookup.
+
+```python
+graph = analyzer.build_dependency_graph(Path("/cloned/my-repo"))
+# {
+#   "app/services/orchestrator.py": [
+#       "app/models/schemas.py",
+#       "app/services/github_service.py",
+#       "app/services/llm_client.py",
+#       "app/services/repo_analyzer.py",
+#   ],
+#   "app/models/schemas.py": [],
+#   ...
+# }
+```
+
+---
+
+### `extract_relevant_context()`
+
+The primary entry point for the healing pipeline. Builds the full dependency graph, identifies the failing file's node, and performs a **bidirectional BFS** (following both forward imports and reverse dependents) up to `depth` hops. The contents of all collected files are returned as a dict.
+
+```python
+def extract_relevant_context(
+    self,
+    repo_dir: Path,
+    failing_file: str,
+    language: str = "python",
+    depth: int = 1,
+) -> dict[str, str]
+```
+
+<ParamField path="repo_dir" type="Path" required>
+  Root of the repository. Passed directly to `build_dependency_graph()`.
+</ParamField>
+
+<ParamField path="failing_file" type="str" required>
+  Repo-relative path (or just a filename) of the file to repair. The method normalises absolute paths and falls back to a `k.endswith("/" + name)` or `Path(k).name == name` match if the exact key is not in the graph.
+</ParamField>
+
+<ParamField path="language" type="str" default="python">
+  Passed through to `build_dependency_graph()`.
+</ParamField>
+
+<ParamField path="depth" type="int" default="1">
+  BFS traversal depth. `depth=1` collects the failing file plus its direct imports and direct dependents. `depth=2` extends one further hop in both directions.
+</ParamField>
+
+**Returns:** `dict[str, str]` — repo-relative file paths mapped to their full UTF-8 contents (`errors="replace"` for binary-safe reading). The failing file itself is always included when it exists on disk.
+
+#### BFS Traversal Detail
+
+The method constructs a **reverse dependency graph** in addition to the forward graph (all files that import the failing file), then runs BFS over the union of forward and reverse edges:
+
+```text
+selected = BFS(
+    start = failing_file_key,
+    neighbours = graph[node] ∪ reverse_graph[node],
+    max_depth = depth,
+)
+```
+
+If the failing file is not present in the graph (e.g., it has no imports and nothing imports it, but it exists on disk), it is included directly by reading it from `repo_path / norm_failing`.
+
+---
+
+## Complete Usage Example
+
+```python
+from pathlib import Path
+from app.services.repo_analyzer import RepoAnalyzer
+
+analyzer = RepoAnalyzer()
+repo = Path("/tmp/autofix-repos/my-org/my-repo")
+
+# Extract context for the failing file and its direct neighbours
+context = analyzer.extract_relevant_context(
+    repo_dir=repo,
+    failing_file="app/utils/parser.py",
+    language="python",
+    depth=1,
+)
+
+print(f"Context covers {len(context)} file(s):")
+for rel_path, source in context.items():
+    print(f"  {rel_path} ({len(source)} chars)")
+
+# Pass to the Healer: build a context string for the prompt
+context_str = ""
+for rel_path, source in context.items():
+    if rel_path != "app/utils/parser.py":
+        context_str += f"\n--- {rel_path} ---\n```python\n{source}\n```\n"
+
+# Example output:
+# Context covers 3 file(s):
+#   app/utils/parser.py (842 chars)
+#   app/models/schemas.py (1204 chars)
+#   app/utils/__init__.py (38 chars)
+```
+
+### Inspecting the Raw Dependency Graph
+
+```python
+graph = analyzer.build_dependency_graph(repo)
+
+# Find all files that import parser.py
+reverse = {k: [] for k in graph}
+for src, targets in graph.items():
+    for tgt in targets:
+        if tgt in reverse:
+            reverse[tgt].append(src)
+
+importers = reverse.get("app/utils/parser.py", [])
+print("Files that import parser.py:", importers)
+```
+
+---
+
+## `LANGUAGE_EXTENSIONS`
+
+The class defines a language → extension mapping used by `build_dependency_graph()`:
+
+```python
+LANGUAGE_EXTENSIONS = {
+    "python": [".py"],
+    "py": [".py"],
+}
+```
+
+Only `.py` files are scanned regardless of the `language` argument value.
+
+<Tip>
+  Increasing `depth` beyond `1` can significantly expand the context included in Healer prompts. For large repositories this may approach token limits. The default `depth=1` is the value used by `run_repo_healing_pipeline()` and is sufficient for most single-file failures.
+</Tip>

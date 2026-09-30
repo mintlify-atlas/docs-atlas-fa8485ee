@@ -1,0 +1,142 @@
+---
+title: "Health Check Endpoints — GET / and GET /health"
+sidebarTitle: "Health Checks"
+description: "Reference for the AutoFix root and health endpoints. Use these for container liveness probes, uptime monitoring, and confirming the engine is reachable."
+---
+
+AutoFix exposes two unauthenticated GET endpoints for health checking. Neither endpoint requires a request body, query parameters, or any authentication headers. Both are suitable for integration with container orchestrators (Docker, Kubernetes), load balancers, and uptime monitors.
+
+---
+
+## GET /
+
+The root endpoint provides a human-readable confirmation that the AutoFix Engine process is running and accepting requests.
+
+**No request body or headers required.**
+
+### Response
+
+```json
+{
+  "message": "AutoFix Engine is running"
+}
+```
+
+<ResponseField name="message" type="string" required>
+  A static string confirming the engine is live. Value is always `"AutoFix Engine is running"`.
+</ResponseField>
+
+### Example
+
+```bash
+curl -s http://localhost:8000/
+```
+
+```json
+{
+  "message": "AutoFix Engine is running"
+}
+```
+
+---
+
+## GET /health
+
+The `/health` endpoint is the canonical liveness probe for the AutoFix service. It returns a single-field JSON object with the value `"healthy"`. Configure your container runtime or load balancer to poll this path to determine whether the instance should receive traffic.
+
+**No request body or headers required.**
+
+### Response
+
+```json
+{
+  "status": "healthy"
+}
+```
+
+<ResponseField name="status" type="string" required>
+  Health status string. Returns `"healthy"` when the application process is running normally.
+</ResponseField>
+
+### Example
+
+```bash
+curl -s http://localhost:8000/health
+```
+
+```json
+{
+  "status": "healthy"
+}
+```
+
+---
+
+## Source Reference
+
+Both endpoints are defined directly on the FastAPI application instance in `app/main.py`:
+
+```python
+@app.get("/")
+async def root():
+    return {"message": "AutoFix Engine is running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+```
+
+---
+
+## Usage in Container Environments
+
+<Tabs>
+  <Tab title="Docker">
+    Add a `HEALTHCHECK` instruction to your `Dockerfile` pointing at the `/health` endpoint:
+
+    ```dockerfile
+    HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+      CMD curl -f http://localhost:8000/health || exit 1
+    ```
+  </Tab>
+  <Tab title="Kubernetes">
+    Use the `/health` path for both `livenessProbe` and `readinessProbe` in your Pod spec:
+
+    ```yaml
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8000
+      initialDelaySeconds: 10
+      periodSeconds: 30
+
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 8000
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    ```
+  </Tab>
+  <Tab title="Docker Compose">
+    Reference the health endpoint in a `healthcheck` block within your `compose.yml`:
+
+    ```yaml
+    services:
+      autofix:
+        build: .
+        ports:
+          - "8000:8000"
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+          interval: 30s
+          timeout: 5s
+          retries: 3
+          start_period: 10s
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Both endpoints respond in microseconds because they perform no I/O. If either endpoint becomes slow or unresponsive, the issue is almost certainly at the OS or network layer rather than in the application code.
+</Tip>

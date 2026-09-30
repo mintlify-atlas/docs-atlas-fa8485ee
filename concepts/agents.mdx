@@ -1,0 +1,237 @@
+---
+title: "AI Agent Personas: Test Engineer & Healer"
+sidebarTitle: "Agents"
+description: "AutoFix's two Gemini AI personas: the Test Engineer generates a pytest suite, and the Healer diagnoses test failures and returns a corrected implementation."
+---
+
+AutoFix delegates its intelligence to two distinct AI agent personas, each with a tightly scoped responsibility and a hardcoded system prompt. The **Test Engineer Agent** generates the verification harness; the **Healer Agent** fixes the code that fails it. Neither persona writes narrative prose — both return executable Python only.
+
+## Test Engineer Agent
+
+The Test Engineer Agent acts as a Senior QA Automation Engineer. Given the target source code and a plain-English description of requirements, it synthesises a comprehensive, standalone `pytest` suite that covers happy paths, boundary conditions, empty/`None` inputs, and any exceptions the requirements specify.
+
+### Function Signature
+
+```python
+async def generate_test_suite(target_code: str, requirements: str) -> str:
+    """Generate a comprehensive pytest suite based on target source code and requirements."""
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `target_code` | `str` | Complete Python source code under test |
+| `requirements` | `str` | Natural-language functional specification |
+
+**Returns** — a clean, executable Python test file as a string, with `import pytest` and `from target import *` guaranteed to be present (injected automatically if the model omits them).
+
+### What it produces
+
+- `test_*` functions following pytest naming conventions
+- `@pytest.mark.parametrize` decorators for data-driven cases
+- `pytest.raises(...)` for expected exception scenarios
+- Modern Python 3.12+ type hints throughout (`list[T]`, `T | None`, etc.)
+
+### System Prompt
+
+The full `PYTHON_TEST_ENGINEER_PROMPT` constant that drives this agent:
+
+```text
+You are a Senior QA Automation Engineer specializing in Python 3.12+ and pytest.
+Your goal is to analyze the provided target Python source code and functional requirements,
+then write a comprehensive, standalone, and robust pytest suite that thoroughly validates
+both happy paths and critical edge cases.
+
+Strict Rules & Constraints:
+1. Target Modern Python: Write idiomatic Python 3.12+ test code utilizing modern type hints
+   (e.g., `list[T]`, `dict[K, V]`, `T | None`).
+2. Module Import: Assume the target source code is located in a module named `target`.
+   Always import target code using: `from target import *`.
+3. Pytest Conventions: Write clean, idiomatic pytest functions named `test_*` utilizing
+   standard `assert` statements and `@pytest.mark.parametrize` where applicable.
+4. Comprehensive Assertions:
+   - Standard expected inputs and outputs (happy paths).
+   - Boundary conditions, edge cases, None/empty inputs, and invalid type handling.
+   - Specific exceptions using `pytest.raises(...)` if the requirements specify raising errors.
+5. Code Only: Output ONLY valid, executable Python test code.
+6. No Commentary: Do NOT include conversational filler, explanations, or markdown commentary.
+   Return either raw Python code or Python code cleanly enclosed in ```python ... ``` blocks.
+```
+
+### Post-processing
+
+After the LLM responds, `generate_test_suite()` calls the internal `_clean_code_blocks()` helper to strip markdown fences, then ensures the two mandatory imports exist:
+
+```python
+# Injected if missing
+if "from target import" not in clean_code and "import target" not in clean_code:
+    clean_code = f"from target import *\n\n{clean_code}"
+
+if "import pytest" not in clean_code:
+    clean_code = f"import pytest\n{clean_code}"
+```
+
+<Note>
+  The Test Engineer Agent runs against `settings.FAST_MODEL` — the lighter, lower-latency Gemini tier — because test generation does not require the full reasoning power needed for diagnosis and patching.
+</Note>
+
+---
+
+## Healer Agent
+
+The Healer Agent acts as a Principal Python Systems Developer. It receives the original broken code, the functional requirements, and the full pytest traceback, then returns a complete, corrected implementation — never a partial snippet or an ellipsis placeholder.
+
+### Function Signature
+
+```python
+async def generate_code_patch(
+    buggy_code: str,
+    requirements: str,
+    error_logs: str,
+) -> str:
+    """Analyze test failures and return a repaired, bug-free implementation of the target code."""
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `buggy_code` | `str` | Current (broken) Python source code |
+| `requirements` | `str` | Original functional specification |
+| `error_logs` | `str` | Full pytest stdout/stderr traceback |
+
+**Returns** — a complete, executable Python source file as a string, with all markdown fences stripped.
+
+### What it produces
+
+- A drop-in replacement for the entire failing file
+- All original function signatures, class names, and method interfaces preserved
+- All detected defects resolved (`IndexError`, `KeyError`, `ZeroDivisionError`, `TypeError`, logic errors, etc.)
+- Full Python 3.12+ type annotations
+
+### System Prompt
+
+The full `PYTHON_HEALER_PROMPT` constant:
+
+```text
+You are a Principal Python Systems Developer specializing in Python 3.12+ software
+debugging, type systems, and automated code remediation.
+Your goal is to inspect the provided broken Python code, functional requirements,
+and pytest execution traceback logs, diagnose root causes, and provide the complete,
+corrected implementation of the target code.
+
+Strict Rules & Constraints:
+1. Idiomatic Python 3.12+: Write clean, high-performance, idiomatic Python 3.12+ code
+   with full type annotations (e.g., `list[T]`, `dict[K, V]`, `X | None`).
+2. Complete Implementation: Output the COMPLETE corrected implementation. Never return
+   partial snippets, ellipsis (`...`), or placeholder code.
+3. Fix All Defects: Resolve all logic defects, runtime exceptions, and failed pytest
+   assertions identified in the test failures and traceback logs.
+4. Interface Preservation: Strictly preserve all existing function signatures, class names,
+   method interfaces, parameter types, and return types.
+5. Code Only: Output ONLY valid, executable Python source code without commentary,
+   explanations, or text outside the code block.
+```
+
+### Post-processing
+
+`generate_code_patch()` applies the same `_clean_code_blocks()` regex pipeline to strip any markdown wrapper the model emits:
+
+```python
+def _clean_code_blocks(raw_text: str) -> str:
+    """Strip markdown code blocks (e.g. ```python and ```) to return only executable Python code."""
+    # 1. Exact fenced block at start/end of response
+    fence_pattern = r"^```(?:python|py)?\s*\n([\s\S]*?)\n```\s*$"
+    match = re.search(fence_pattern, text, re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+
+    # 2. Longest fenced block anywhere in the response
+    general_pattern = r"```(?:python|py)?\s*\n([\s\S]*?)\n```"
+    matches = list(re.finditer(general_pattern, text))
+    if matches:
+        longest = max(matches, key=lambda m: len(m.group(1)))
+        return longest.group(1).strip()
+
+    # 3. Unclosed opening fence — strip the fence line
+    if text.startswith("```"):
+        lines = text.splitlines()[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    return text
+```
+
+<Note>
+  The Healer Agent runs against `settings.PRIMARY_MODEL` — the full-capability Gemini tier — because accurate root-cause diagnosis requires maximum model quality.
+</Note>
+
+---
+
+## Side-by-Side Comparison
+
+The two agents share the same async call pattern but differ in their inputs, system prompts, and model tier:
+
+| | Test Engineer | Healer |
+|---|---|---|
+| **Function** | `generate_test_suite()` | `generate_code_patch()` |
+| **Inputs** | `target_code`, `requirements` | `buggy_code`, `requirements`, `error_logs` |
+| **Output** | Complete pytest suite | Complete corrected source file |
+| **Model tier** | `FAST_MODEL` | `PRIMARY_MODEL` |
+| **System prompt** | `PYTHON_TEST_ENGINEER_PROMPT` | `PYTHON_HEALER_PROMPT` |
+| **Post-processing** | Inject `import pytest` + `from target import *` if missing | Strip markdown fences only |
+
+```python test_engineer.py
+# app/agents/test_engineer.py
+async def generate_test_suite(target_code: str, requirements: str) -> str:
+    raw_response = await call_gemini(
+        prompt=user_prompt,
+        system_instruction=TEST_ENGINEER_SYSTEM_PROMPT,
+        model=settings.FAST_MODEL,   # lighter, lower-latency tier
+    )
+    clean_code = _clean_code_blocks(raw_response)
+    # Guarantee mandatory imports
+    if "from target import" not in clean_code:
+        clean_code = f"from target import *\n\n{clean_code}"
+    if "import pytest" not in clean_code:
+        clean_code = f"import pytest\n{clean_code}"
+    return clean_code.strip()
+```
+
+```python healer.py
+# app/agents/healer.py
+async def generate_code_patch(
+    buggy_code: str,
+    requirements: str,
+    error_logs: str,
+) -> str:
+    raw_response = await call_gemini(
+        prompt=user_prompt,
+        system_instruction=HEALER_SYSTEM_PROMPT,
+        model=settings.PRIMARY_MODEL,  # full-capability tier
+    )
+    return _clean_code_blocks(raw_response).strip()
+```
+
+---
+
+## Agent Constraints at a Glance
+
+<CardGroup cols={2}>
+  <Card title="Test Engineer Constraints" icon="flask">
+    - Always imports via `from target import *`
+    - Uses only `pytest` standard assertions — no `unittest`
+    - Returns executable code only, no prose
+    - Covers edge cases, boundaries, and expected exceptions
+    - Uses Python 3.12+ type hints
+  </Card>
+  <Card title="Healer Constraints" icon="wrench">
+    - Outputs a **complete** file — never partial snippets
+    - Preserves all existing function signatures exactly
+    - Resolves every failing test, not just the first
+    - Returns executable code only, no explanatory text
+    - Uses Python 3.12+ type hints throughout
+  </Card>
+</CardGroup>

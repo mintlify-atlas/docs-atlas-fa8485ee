@@ -1,0 +1,333 @@
+---
+title: "Healing Pipeline: Orchestrating the Self-Repair Loop"
+sidebarTitle: "Pipeline"
+description: "The two orchestrator pipelines that coordinate test generation, sandbox execution, and Healer patches into an autonomous Python code self-repair loop."
+---
+
+The orchestrator in `app/services/orchestrator.py` is the connective tissue of AutoFix. It sequences the Test Engineer Agent, the Python sandbox, and the Healer Agent into a deterministic loop that keeps iterating until either all tests pass or `MAX_HEALING_ITERATIONS` is exhausted. Two pipeline variants exist: one for in-memory code snippets (`run_healing_pipeline`) and one for files already on disk inside a cloned repository (`run_repo_healing_pipeline`).
+
+## Shared Utilities
+
+Before examining the pipelines, two utility functions that both variants rely on are worth understanding in isolation.
+
+### `clean_code_fences()`
+
+Every LLM response is passed through `clean_code_fences()` before being written to disk. Models frequently wrap their output in markdown code fences even when instructed not to; this function strips them reliably:
+
+```python
+def clean_code_fences(code: str) -> str:
+    """Strip leading and trailing markdown code fences across code blocks."""
+    text = code.strip()
+
+    # 1. Exact fenced block spanning the whole response
+    fence_pattern = r"^```[a-zA-Z0-9_+#-]*\s*\n([\s\S]*?)\n```\s*$"
+    match = re.search(fence_pattern, text)
+    if match:
+        return match.group(1).strip()
+
+    # 2. Longest fenced block embedded anywhere in the response
+    general_pattern = r"```[a-zA-Z0-9_+#-]*\s*\n([\s\S]*?)\n```"
+    matches = list(re.finditer(general_pattern, text))
+    if matches:
+        longest = max(matches, key=lambda m: len(m.group(1)))
+        return longest.group(1).strip()
+
+    # 3. Unclosed opening fence — drop the fence line itself
+    if text.startswith("```"):
+        lines = text.splitlines()[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    return text
+```
+
+The three-pass approach handles the full range of model output styles: clean fence wrappers, fences embedded in a longer response, and truncated fences that lack a closing delimiter.
+
+### `extract_test_summary()`
+
+At the end of a pipeline run, `extract_test_summary()` parses both the initial failure logs and the final sandbox output to produce a per-test-case status mapping:
+
+```python
+def extract_test_summary(
+    failing_logs: str = "",
+    final_output: str = "",
+    test_target: str = "",
+    success: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Extract individual test case statuses between initial failure and final sandbox run."""
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `failing_logs` | `str` | Raw pytest stdout from the first (pre-healing) run |
+| `final_output` | `str` | Raw pytest stdout from the last completed run |
+| `test_target` | `str` | Fallback test name when no individual cases are found |
+| `success` | `bool` | Whether the final run passed overall |
+
+**Returns** — `dict[str, dict[str, str]]` shaped like:
+
+```python
+{
+    "tests/test_target.py::test_add_positive": {
+        "initial": "Failed ❌",
+        "final":   "Passed ✅",
+    },
+    "tests/test_target.py::test_divide_by_zero": {
+        "initial": "Failed ❌",
+        "final":   "Passed ✅",
+    },
+}
+```
+
+It uses two regex patterns to handle both pytest output orderings (`test::name STATUS` and `STATUS test::name`):
+
+```python
+patterns = [
+    r"([\w/\.\-]+::\w+(?:\[[^\]]+\])?)\\s+(PASSED|FAILED|ERROR)",
+    r"(FAILED|PASSED|ERROR)\s+([\w/\.\-]+::\w+(?:\[[^\]]+\])?)",
+]
+```
+
+If no individual test names are found in the output (e.g. a collection error before any test ran), it falls back to a single synthetic entry keyed by `test_target`.
+
+---
+
+## Pipeline 1: `run_healing_pipeline()`
+
+The in-memory pipeline accepts a `HealRequest` containing pasted code and requirements. No repository or file system access is required — the source code is written to the configured `WORKSPACE_DIR` for the duration of the run, then cleaned up.
+
+```python
+async def run_healing_pipeline(request: HealRequest) -> HealResponse:
+    """Orchestrate the multi-agent code self-healing pipeline dedicated to Python projects."""
+```
+
+**Input — `HealRequest`**
+
+```python
+class HealRequest(BaseModel):
+    language: str = "python"
+    buggy_code: str          # the broken Python source
+    requirements: str        # plain-English functional specification
+    file_path: str = "target.py"  # written as this filename in the workspace
+```
+
+**Output — `HealResponse`**
+
+The full response schema including `success`, `final_code`, `generated_tests`, `patches`, `logs`, `test_summary`, and `audit_report`. See [HealResponse schema](/api-reference/schemas/heal-response) for the complete field list.
+
+### Steps
+
+<Steps>
+  <Step title="Pipeline Initialisation">
+    A timestamped `LogEntry` is appended for `PIPELINE_INIT`. The source filename is determined from `request.file_path` (defaulting to `"target.py"`); the test filename is fixed as `"test_target.py"`.
+  </Step>
+  <Step title="Test Generation (Test Engineer Agent)">
+    The Test Engineer Agent receives `request.requirements` and `request.buggy_code` in a structured prompt. `call_gemini()` is invoked with `settings.PRIMARY_MODEL`. The raw response is cleaned with `clean_code_fences()`.
+
+    If this step raises an exception, the pipeline returns immediately with `success=False` and `iterations=0`.
+  </Step>
+  <Step title="Sandbox Preparation">
+    The workspace is cleaned with `sandbox.clean()`, then `sandbox.write_files()` writes both `target.py` (the buggy code) and `test_target.py` (the generated tests) to `settings.WORKSPACE_DIR`.
+  </Step>
+  <Step title="Self-Healing Loop">
+    The loop runs up to `settings.MAX_HEALING_ITERATIONS` times:
+
+    1. `sandbox.run_tests()` executes pytest with a 30-second timeout
+    2. If `passed=True` → set `success=True`, break
+    3. If `passed=False` → increment `iteration`, call the Healer Agent with the current code and the failure output
+    4. Write the patched code back to the workspace with `sandbox.write_files()`
+    5. Repeat
+
+    The initial failure logs (from iteration 0) are preserved separately so `extract_test_summary()` can compare them against the final run.
+  </Step>
+  <Step title="Cleanup & Response Assembly">
+    `sandbox.clean()` removes all bytecode artifacts. The final version of `target.py` is read from disk. A `FilePatch` is created if the code changed. `extract_test_summary()` and `build_healing_audit_report()` are called, and the full `HealResponse` is returned.
+  </Step>
+</Steps>
+
+### Error handling
+
+Each of the three major phases — test generation, sandbox prep, and healer invocation — is wrapped in a `try/except`. On any unhandled exception, an `ERROR` log entry is appended and the pipeline returns early with `success=False` and whatever partial state was accumulated.
+
+---
+
+## Pipeline 2: `run_repo_healing_pipeline()`
+
+The repository pipeline operates on files already on disk inside a cloned repository. It skips test generation entirely (tests are assumed to already exist in the repo) and instead focuses on repairing the failing source file in place, guided by AST-extracted module context.
+
+```python
+async def run_repo_healing_pipeline(
+    repo_dir: Path,
+    language: str = "python",
+    failing_file: str = "target.py",
+    failing_logs: str = "",
+) -> HealResponse:
+    """Diagnose and heal Python code directly within a repository using
+    AST context and sandbox test runners."""
+```
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `repo_dir` | `Path` | — | Absolute path to the cloned repository root |
+| `language` | `str` | `"python"` | Target language (only Python supported currently) |
+| `failing_file` | `str` | `"target.py"` | Repo-relative path to the file that needs healing |
+| `failing_logs` | `str` | `""` | Initial pytest failure output from the triggering CI run |
+
+**Output** — same `HealResponse` schema as `run_healing_pipeline()`.
+
+### Steps
+
+<Steps>
+  <Step title="Pipeline Initialisation">
+    `RepoAnalyzer` and `PythonAdapter` instances are created. A `REPO_PIPELINE_INIT` log entry records the repository name and failing file.
+  </Step>
+  <Step title="AST Context Extraction">
+    `RepoAnalyzer.extract_relevant_context()` is called with `depth=1`. It returns a `dict[str, str]` of related file contents. If the failing file is not found in the repo, the pipeline returns immediately with `success=False`.
+  </Step>
+  <Step title="Self-Healing Loop (Repair in Place)">
+    Unlike the in-memory pipeline, this loop **does not run tests first**. It starts by immediately calling the Healer Agent, passing:
+    - All context files as labelled code blocks
+    - The current content of the failing file
+    - The current failure logs
+
+    After patching, `target_file_path.write_text(patched_code)` writes the change directly into the repository. `sandbox.run_tests()` is then called on the repository root. If tests pass, `success=True` and the loop breaks. Otherwise `current_logs` is updated with the new output and the next iteration begins.
+  </Step>
+  <Step title="Cleanup & Response Assembly">
+    `sandbox.clean(repo_path)` removes artifacts. The final file content is read, patches are recorded, and `extract_test_summary()` + `build_healing_audit_report()` produce the audit trail. The `HealResponse` is returned.
+  </Step>
+</Steps>
+
+<Warning>
+  `run_repo_healing_pipeline()` writes patched code directly to the repository files on disk. When called from the GitHub integration, the repository is a temporary clone and the patch is committed back via `GitHubService`. Do not call this function against a working tree you care about without a backup.
+</Warning>
+
+---
+
+## Side-by-Side Comparison
+
+<Tabs>
+  <Tab title="In-Memory Pipeline">
+    **Signature**
+    ```python
+    async def run_healing_pipeline(request: HealRequest) -> HealResponse:
+    ```
+
+    **Typical usage from the `/heal` endpoint**
+    ```python
+    from app.models.schemas import HealRequest
+    from app.services.orchestrator import run_healing_pipeline
+
+    request = HealRequest(
+        buggy_code="""
+    def divide(a, b):
+        return a / b
+    """,
+        requirements=(
+            "divide(a, b) should return a divided by b. "
+            "Raise ValueError when b is zero."
+        ),
+        file_path="target.py",
+    )
+    response = await run_healing_pipeline(request)
+
+    print(response.success)       # True
+    print(response.iterations_used)  # e.g. 1
+    print(response.final_code)    # corrected divide() implementation
+    print(response.generated_tests)  # full pytest suite
+    ```
+
+    **Key characteristics**
+    - Generates the test suite from scratch via Test Engineer Agent
+    - Writes files to `settings.WORKSPACE_DIR` (a temp workspace)
+    - Does not touch any repository on disk
+    - Best for the `/heal` REST endpoint (single-file self-healing)
+  </Tab>
+  <Tab title="Repository Pipeline">
+    **Signature**
+    ```python
+    async def run_repo_healing_pipeline(
+        repo_dir: Path,
+        language: str = "python",
+        failing_file: str = "target.py",
+        failing_logs: str = "",
+    ) -> HealResponse:
+    ```
+
+    **Typical usage from the GitHub webhook handler**
+    ```python
+    from pathlib import Path
+    from app.services.orchestrator import run_repo_healing_pipeline
+
+    response = await run_repo_healing_pipeline(
+        repo_dir=Path("/tmp/clones/my-org/my-repo"),
+        language="python",
+        failing_file="app/services/order_processor.py",
+        failing_logs=ci_failure_output,   # raw pytest stdout from CI
+    )
+
+    print(response.success)
+    print(response.patched_code)    # final corrected source
+    print(response.audit_report)   # markdown report posted as PR comment
+    ```
+
+    **Key characteristics**
+    - Skips test generation — uses tests already in the repo
+    - Uses `RepoAnalyzer` to supply AST-derived context to the Healer
+    - Writes patches directly into the repository file on disk
+    - Best for the GitHub App integration (full-repo self-healing)
+  </Tab>
+</Tabs>
+
+---
+
+## Log Step Reference
+
+Both pipelines emit structured `LogEntry` objects at each stage. The `step_name` values follow this progression:
+
+| Step Name | Pipeline | Description |
+|---|---|---|
+| `PIPELINE_INIT` | In-memory | Pipeline started |
+| `REPO_PIPELINE_INIT` | Repository | Pipeline started |
+| `TEST_GENERATION` | In-memory | Test Engineer Agent invoked |
+| `TEST_GENERATION_SUCCESS` | In-memory | Test suite written to log |
+| `AST_CONTEXT_EXTRACTION` | Repository | `RepoAnalyzer.extract_relevant_context()` started |
+| `AST_CONTEXT_READY` | Repository | Context files enumerated |
+| `SANDBOX_PREP` | In-memory | Workspace cleaned and files written |
+| `SANDBOX_RUN` | In-memory | pytest execution started |
+| `REPO_HEALER_START` | Repository | Healer Agent invoked in repo loop |
+| `HEALER_START` | In-memory | Healer Agent invoked in memory loop |
+| `TESTS_PASSED` | Both | All tests passed |
+| `TESTS_FAILED` | Both | Tests failed; includes full pytest output |
+| `CODE_PATCHED` | In-memory | Patched code written to workspace |
+| `REPO_CODE_PATCHED` | Repository | Patched code written to repository file |
+| `MAX_ITERATIONS_REACHED` | In-memory | Loop exhausted without passing |
+| `ERROR` | Both | Unhandled exception; pipeline may abort |
+| `PIPELINE_COMPLETE` | In-memory | Final status logged |
+| `REPO_PIPELINE_COMPLETE` | Repository | Final status logged |
+
+<Tip>
+  The full `logs` array in `HealResponse` is an ordered trace of every step. When debugging a failed healing run, read through `response.logs` to identify exactly which iteration produced which failure output, and which agent response triggered which patch.
+</Tip>
+
+---
+
+## Configuration
+
+Both pipelines respect the global `settings` object from `app/core/config.py`:
+
+```python
+class Settings(BaseSettings):
+    PRIMARY_MODEL: str = "gemini-3.6-flash"   # used for Healer and (in-memory) Test Engineer
+    FAST_MODEL: str = "gemini-3.6-flash"       # used for Test Engineer in generate_test_suite()
+    WORKSPACE_DIR: Path = Path("./workspace")  # sandbox root for in-memory pipeline
+    MAX_HEALING_ITERATIONS: int = 3            # maximum loop iterations for both pipelines
+```
+
+<Note>
+  `MAX_HEALING_ITERATIONS` defaults to `3`. Increasing it raises the chance of a successful heal on complex bugs but also increases LLM API cost and latency. The value is included in every `HealResponse` as `max_iterations`.
+</Note>

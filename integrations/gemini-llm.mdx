@@ -1,0 +1,400 @@
+---
+title: "Google Gemini LLM Integration: Multi-Model Tiering"
+sidebarTitle: "Gemini LLM"
+description: "How AutoFix calls Google Gemini with async multi-model fallback chains, transient-error retries, 503 fast-fail, and markdown fence stripping for clean agent output."
+---
+
+AutoFix uses Google Gemini as the AI backbone for both the Test Engineer and Healer agents. Rather than hard-wiring a single model, the client implements a **multi-model tiering strategy**: every call starts with a primary model and automatically falls through an ordered list of fallback candidates when the primary is rate-limited, overloaded, or returns a non-retryable error. This page documents the `call_gemini()` function, the retry and fallback logic, the singleton client, and the model configuration that drives all of this.
+
+## Function Signature
+
+`call_gemini()` is the single async entry point used by every AI agent in AutoFix. It lives in `app/services/llm_client.py`.
+
+```python
+async def call_gemini(
+    prompt: str,
+    system_instruction: str = "",
+    model: Optional[str] = None,
+    max_retries: int = 2,
+) -> Optional[str]:
+```
+
+### Parameters
+
+<ParamField body="prompt" type="string" required>
+  The user-facing content sent to the model. In practice this is the full healer or test-engineer prompt assembled by the orchestrator — including the source code, requirements, and failure logs.
+</ParamField>
+
+<ParamField body="system_instruction" type="string">
+  The system-level instruction that shapes model behaviour. Each agent passes its own system prompt from `app/core/prompt_templates.py`. Defaults to an empty string, in which case no system instruction is forwarded to the API.
+</ParamField>
+
+<ParamField body="model" type="string">
+  Override the primary model for this specific call. When omitted, `PRIMARY_MODEL` from `settings` is used. The fallback chain is built relative to whichever model is selected here.
+</ParamField>
+
+<ParamField body="max_retries" type="integer">
+  Maximum number of attempts **per model candidate** before the client advances to the next model. Defaults to `2`. Each attempt uses an increasing backoff delay from `QUICK_BACKOFF_DELAYS`.
+</ParamField>
+
+### Return Value
+
+<ResponseField name="result" type="string | None">
+  The model's text response with all Markdown code fences stripped. Returns `None` only if all candidate models produce empty responses without raising an error. If every model fails with an exception, a `RuntimeError` is raised.
+</ResponseField>
+
+---
+
+## Model Configuration
+
+Model names are defined in `app/core/config.py` as `Settings` fields loaded from environment variables.
+
+```python
+class Settings(BaseSettings):
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    PRIMARY_MODEL: str = "gemini-3.6-flash"
+    FAST_MODEL: str = "gemini-3.6-flash"
+```
+
+At module load time, `llm_client.py` resolves the primary model and builds the fallback list:
+
+```python
+PRIMARY_MODEL = getattr(settings, "GEMINI_MODEL", "gemini-3.6-flash")
+
+FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-flash-latest",
+]
+```
+
+<Note>
+  Override `PRIMARY_MODEL` (or `GEMINI_MODEL`) in your `.env` file to pin a different model. `FAST_MODEL` is available as a separate reference for latency-sensitive calls but currently resolves to the same default.
+</Note>
+
+---
+
+## Multi-Model Tiering
+
+Every `call_gemini()` invocation builds a **candidate list** by placing the selected primary model first, then appending all fallback models that are not already in position zero:
+
+```python
+primary = model or getattr(settings, "GEMINI_MODEL", None) or PRIMARY_MODEL
+candidate_models = [primary] + [m for m in FALLBACK_MODELS if m != primary]
+```
+
+For a default configuration this expands to:
+
+```
+1. gemini-3.6-flash       ← PRIMARY_MODEL
+2. gemini-3.5-flash       ← FALLBACK_MODELS[0]
+3. gemini-3.5-flash-lite  ← FALLBACK_MODELS[1]
+4. gemini-3.7-flash       ← FALLBACK_MODELS[2]
+5. gemini-flash-latest    ← FALLBACK_MODELS[3]
+```
+
+The client iterates through this list. If a model is overloaded (503) it skips immediately to the next. If a model produces a transient error (429) it retries with backoff first before advancing. Non-retryable errors (400, 401, 404) also skip to the next model without any delay.
+
+---
+
+## Retry and Backoff Logic
+
+```python
+QUICK_BACKOFF_DELAYS = [1, 2]
+```
+
+For each model candidate, `call_gemini()` makes up to `max_retries` attempts (default 2). The delay between attempts comes from `QUICK_BACKOFF_DELAYS` — 1 second before the first retry, 2 seconds before the second. If `max_retries` exceeds the length of this list, the last entry is doubled for any additional attempts.
+
+```python
+delay = QUICK_BACKOFF_DELAYS[attempt] if attempt < len(QUICK_BACKOFF_DELAYS) else QUICK_BACKOFF_DELAYS[-1] * 2
+await asyncio.sleep(delay)
+```
+
+The full per-model attempt loop:
+
+```python
+for model_name in candidate_models:
+    for attempt in range(max_retries):
+        print(f"[LLM_CLIENT] Attempting model: {model_name}")
+        try:
+            response = await asyncio.to_thread(
+                get_client().models.generate_content,
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+            if response and response.text:
+                print(f"[LLM_CLIENT] Success on model: {model_name}")
+                return strip_markdown_fences(response.text)
+        except Exception as e:
+            print(f"[LLM_CLIENT] Error on model {model_name}: {e}")
+            if _is_503_overloaded(e):
+                break          # skip to next candidate immediately
+            if not _is_transient_error(e):
+                break          # non-retryable: skip to next candidate
+            await asyncio.sleep(delay)  # transient: wait and retry
+```
+
+<Tip>
+  `asyncio.to_thread()` is used because the underlying `google-genai` SDK's `generate_content` call is synchronous. Wrapping it in `to_thread` prevents blocking the FastAPI event loop during LLM calls.
+</Tip>
+
+---
+
+## Error Classification
+
+### `_is_503_overloaded()`
+
+Detects model overload / high-demand conditions. A 503 triggers an **immediate skip** to the next candidate — no retry, no backoff.
+
+```python
+def _is_503_overloaded(e: Exception) -> bool:
+    code = getattr(e, "status_code", None) or getattr(e, "code", None)
+    status = getattr(e, "status", None)
+    err_str = str(e).lower()
+    msg = (getattr(e, "message", None) or "").lower()
+
+    if code == 503:
+        return True
+    if isinstance(status, str) and status.upper() == "UNAVAILABLE":
+        return True
+    if isinstance(e, errors.ServerError) and (code == 503 or "503" in err_str):
+        return True
+    if "503" in err_str or "503" in msg:
+        return True
+    if "high demand" in err_str or "high demand" in msg:
+        return True
+    if "unavailable" in err_str or "unavailable" in msg:
+        return True
+    response = getattr(e, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 503:
+        return True
+    return False
+```
+
+The check is intentionally broad — it inspects HTTP status codes, gRPC status strings (`UNAVAILABLE`), error message text, and the `response` attribute to handle every surface the Google GenAI SDK might use to surface a 503.
+
+### `_is_transient_error()`
+
+Determines whether an error is worth retrying with backoff. A transient error allows up to `max_retries` attempts on the same model before moving on.
+
+```python
+def _is_transient_error(e: Exception) -> bool:
+    if _is_503_overloaded(e):
+        return True
+
+    code = getattr(e, "status_code", None) or getattr(e, "code", None)
+    status = getattr(e, "status", None)
+
+    if isinstance(e, errors.ServerError):
+        return True
+
+    # 429 RESOURCE_EXHAUSTED / rate limit
+    if code == 429 or (isinstance(status, str) and status.upper() in ("RESOURCE_EXHAUSTED", "TOO_MANY_REQUESTS")):
+        return True
+    if "resource_exhausted" in str(e).lower() or "too many requests" in str(e).lower():
+        return True
+
+    response = getattr(e, "response", None)
+    if response is not None and getattr(response, "status_code", None) in (503, 429):
+        return True
+
+    return False
+```
+
+<Tabs>
+  <Tab title="Retryable Errors (backoff applies)">
+    - **429 RESOURCE\_EXHAUSTED** — quota exceeded or rate limited
+    - **503 UNAVAILABLE** — model under high demand (also triggers immediate next-model skip)
+    - Any `errors.ServerError` from the Google GenAI SDK
+  </Tab>
+  <Tab title="Non-Retryable Errors (skip immediately)">
+    - **400 Bad Request** — malformed prompt or unsupported configuration
+    - **401 Unauthorized** — invalid or missing API key
+    - **404 Not Found** — model name does not exist or is unavailable in the region
+    - Any other error not matched by `_is_transient_error()`
+  </Tab>
+</Tabs>
+
+---
+
+## Decision Flowchart
+
+When all candidates are exhausted without a successful response, `call_gemini()` raises:
+
+```python
+print("[LLM_CLIENT] All candidate models failed.")
+
+if isinstance(last_error, errors.APIError):
+    raise RuntimeError(f"Gemini API Error: {err_msg}") from last_error
+if last_error:
+    raise RuntimeError(f"LLM generation failed: {str(last_error)}") from last_error
+
+return None
+```
+
+The full decision path for each model attempt:
+
+```
+START: attempt model_name
+  │
+  ├─ Success → strip_markdown_fences() → return result
+  │
+  ├─ 503 Overloaded → log warning → break inner loop → next candidate
+  │
+  ├─ Non-retryable error (400/401/404) → log error → break → next candidate
+  │
+  └─ Transient error (429/ServerError) → sleep(backoff) → retry
+                                              │
+                                         max_retries exhausted
+                                              │
+                                         next candidate
+```
+
+---
+
+## Singleton Client: `get_client()`
+
+The Google GenAI client is instantiated once and reused for all requests. The module-level `_client` variable is lazily initialised on the first call.
+
+```python
+_client = None
+
+def get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        api_key = (
+            getattr(settings, "GOOGLE_API_KEY", None)
+            or getattr(settings, "GEMINI_API_KEY", None)
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+        )
+        if not api_key:
+            raise ValueError("Google API key is not configured in settings or environment.")
+        _client = genai.Client(api_key=api_key)
+    return _client
+```
+
+The resolution order for the API key is:
+1. `settings.GOOGLE_API_KEY` (loaded from `.env` via Pydantic Settings)
+2. `settings.GEMINI_API_KEY` (alternate key name in settings)
+3. `os.environ["GOOGLE_API_KEY"]` (raw environment variable)
+4. `os.environ["GEMINI_API_KEY"]` (alternate environment variable)
+
+`get_genai_client` is exported as an alias for backward compatibility with older call sites.
+
+<Warning>
+  If no API key is found through any of the four resolution paths, `get_client()` raises a `ValueError` at call time — not at import time. The service will start without a key but every LLM call will immediately fail.
+</Warning>
+
+---
+
+## Generation Configuration
+
+Every `call_gemini()` call creates a `GenerateContentConfig` with a deterministic temperature:
+
+```python
+config = types.GenerateContentConfig(
+    system_instruction=system_instruction if system_instruction else None,
+    temperature=0.1,
+)
+```
+
+`temperature=0.1` keeps model output near-deterministic. This is intentional: code patches and test suites must be consistent and reproducible across pipeline iterations. Higher temperatures would introduce random variation that could cause a healed file to differ between healing attempts even when given identical input.
+
+---
+
+## Markdown Fence Stripping
+
+LLMs frequently wrap code output in Markdown code fences (` ```python ... ``` `). AutoFix must extract raw source before writing it to disk or returning it to callers. `strip_markdown_fences()` handles all common fence formats:
+
+```python
+def strip_markdown_fences(text: str) -> str:
+    if not text:
+        return ""
+
+    s = text.strip()
+
+    # Standard multiline fenced block: ```lang\n...content...\n```
+    match = re.match(r"^```(?:[a-zA-Z0-9_+-]+)?\s*\n([\s\S]*?)\n```\s*$", s)
+    if match:
+        return match.group(1).strip()
+
+    # Single-line / inline fenced block: ```lang ... ```
+    match = re.match(r"^```(?:[a-zA-Z0-9_+-]+)?\s*([\s\S]*?)\s*```$", s)
+    if match:
+        return match.group(1).strip()
+
+    # Unclosed opening fence or trailing closing fence
+    if s.startswith("```"):
+        lines = s.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    return s
+```
+
+The three cases handled are:
+
+| Case | Example Input | Behaviour |
+| :--- | :--- | :--- |
+| Standard fenced block | ` ```python\ndef f(): ...\n``` ` | Extracts content between fences |
+| Inline / single-line fence | ` ```python def f(): pass``` ` | Extracts content stripping delimiters |
+| Unclosed opening fence | ` ```\ndef f(): pass` | Drops the opening line, returns remaining |
+
+All three cases call `.strip()` on the extracted content to remove any surrounding blank lines before the cleaned code is passed to the orchestrator or written to a file.
+
+---
+
+## Complete Usage Example
+
+The following is how `run_healing_pipeline()` in `app/services/orchestrator.py` calls `call_gemini()` for the Healer agent:
+
+```python
+raw_patch = await call_gemini(
+    prompt=healer_prompt,
+    system_instruction=get_healer_prompt(lang),
+    model=settings.PRIMARY_MODEL,
+)
+patched_code = clean_code_fences(raw_patch)
+```
+
+And the Test Engineer agent call:
+
+```python
+raw_tests = await call_gemini(
+    prompt=test_prompt,
+    system_instruction=get_test_engineer_prompt(lang),
+    model=settings.PRIMARY_MODEL,
+)
+generated_tests = clean_code_fences(raw_tests)
+```
+
+Both agents pass a `system_instruction` specific to their role and operate on `settings.PRIMARY_MODEL`. The fallback chain is transparent to callers — from the orchestrator's perspective, `call_gemini()` either returns a clean string or raises a `RuntimeError`.
+
+---
+
+## Environment Variables
+
+<ParamField body="GOOGLE_API_KEY" type="string" required>
+  Primary Google API key for authenticating with the Gemini API. Takes precedence over `GEMINI_API_KEY`.
+</ParamField>
+
+<ParamField body="GEMINI_API_KEY" type="string">
+  Alternate API key name. Used as a fallback when `GOOGLE_API_KEY` is not set. Both environment variables and Pydantic settings keys are checked.
+</ParamField>
+
+<ParamField body="GEMINI_MODEL" type="string">
+  Overrides the default primary model. Defaults to `gemini-3.6-flash`. Also read as `PRIMARY_MODEL` in settings.
+</ParamField>
+
+<ParamField body="PRIMARY_MODEL" type="string">
+  Explicit primary model setting. Defaults to `gemini-3.6-flash`. If both `GEMINI_MODEL` and `PRIMARY_MODEL` are set, `GEMINI_MODEL` is used by `get_client()` while `PRIMARY_MODEL` is used by the orchestrator directly via `settings.PRIMARY_MODEL`.
+</ParamField>
+
+<ParamField body="FAST_MODEL" type="string">
+  Reference model for latency-sensitive calls. Currently defaults to `gemini-3.6-flash`. Available as `settings.FAST_MODEL` for future use in time-critical pipeline steps.
+</ParamField>

@@ -1,0 +1,111 @@
+{
+  "projectType": "api-service",
+  "projectName": "AutoFix",
+  "projectDescription": "An autonomous multi-agent code self-healing pipeline that uses Google Gemini AI to generate test suites, execute them in a secure sandbox, diagnose failures, and patch Python source code automatically.",
+  "theme": "luma",
+  "primaryColor": "#fbde58",
+  "lightColor": "#d0d6d4",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment",
+              "configuration/github-app"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agents",
+              "concepts/sandbox",
+              "concepts/ast-analyzer",
+              "concepts/healing-pipeline"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/github-webhooks",
+              "integrations/gemini-llm"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "REST API",
+            "pages": [
+              "api-reference/overview",
+              "api-reference/health",
+              "api-reference/github-webhook"
+            ]
+          },
+          {
+            "group": "Schemas",
+            "pages": [
+              "api-reference/schemas/heal-request",
+              "api-reference/schemas/heal-response",
+              "api-reference/schemas/log-entry",
+              "api-reference/schemas/file-patch"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "api-reference/services/orchestrator",
+              "api-reference/services/github-service",
+              "api-reference/services/llm-client",
+              "api-reference/services/repo-analyzer",
+              "api-reference/services/sandbox-adapter"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-agent architecture with specialized Test Engineer and Healer AI personas powered by Google Gemini",
+    "Autonomous pytest suite generation from functional requirements and source code",
+    "Iterative self-healing loop: generate tests → run in sandbox → diagnose failures → patch code → re-verify",
+    "AST-based dependency graph analysis to extract relevant repository context for healing",
+    "GitHub App integration: listens to pull request webhooks and posts audit reports as PR comments",
+    "Isolated Python sandbox execution using subprocess with configurable timeout and cleanup",
+    "Multi-model LLM tiering with automatic fallback and retry logic for 503/429 errors",
+    "Structured Markdown audit reports with per-test-case initial vs. final status tracking"
+  ],
+  "publicApiSurface": [
+    "POST /api/github/webhook — GitHub webhook receiver for pull_request events",
+    "GET / — Root health check returning engine status",
+    "GET /health — Liveness probe endpoint",
+    "run_healing_pipeline(request: HealRequest) -> HealResponse — Core orchestrator for in-memory code healing",
+    "run_repo_healing_pipeline(repo_dir, language, failing_file, failing_logs) -> HealResponse — Repository-level healing pipeline",
+    "generate_test_suite(target_code, requirements) -> str — Test Engineer agent: generates pytest suite",
+    "generate_code_patch(buggy_code, requirements, error_logs) -> str — Healer agent: generates corrected code",
+    "call_gemini(prompt, system_instruction, model, max_retries) -> str | None — Async Gemini LLM client with fallback",
+    "RepoAnalyzer.extract_relevant_context(repo_dir, failing_file, language, depth) -> dict — AST context extractor",
+    "RepoAnalyzer.build_dependency_graph(repo_dir, language) -> dict — Python import graph builder",
+    "PythonAdapter.run_tests(workspace, timeout, test_file) -> tuple[bool, str] — Pytest sandbox runner",
+    "GitHubService.clone_repository(repo_full_name, branch, destination, installation_id, token) -> bool",
+    "GitHubService.commit_and_push_patch(repo_dir, branch, commit_message, token) -> bool",
+    "GitHubService.post_pr_comment(repo_full_name, pr_number, comment_markdown, token) -> bool",
+    "build_healing_audit_report(**kwargs) -> str — Markdown audit report builder",
+    "HealRequest — Pydantic schema: buggy_code, requirements, file_path, language",
+    "HealResponse — Pydantic schema: success, iterations_used, final_code, generated_tests, patches, logs, audit_report",
+    "format_pr_audit_event(event_type, payload) -> dict — Webhook payload formatter"
+  ]
+}

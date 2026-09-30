@@ -1,0 +1,118 @@
+---
+title: "FilePatch — Per-File Healed Code Patch Record Schema"
+sidebarTitle: "FilePatch"
+description: "Pydantic schema capturing the before-and-after content of every file the Healer agent modified, enabling precise diffs, rollbacks, and audit reporting."
+---
+
+When the AutoFix Healer agent successfully repairs a source file, it produces a `FilePatch` record that preserves both the original and the corrected content side-by-side. These records are collected into the `patches` list on `HealResponse` and serve as the authoritative diff between the broken state the pipeline received and the passing state it delivered. Patches are also used to populate the `audit_report` field and, in the GitHub App integration, to commit changes back to a pull request branch.
+
+## When Is a Patch Created?
+
+A `FilePatch` is only appended when the pipeline determines that the final code actually changed from what was submitted. The orchestrator performs an explicit string comparison before constructing the record:
+
+```python
+# From app/services/orchestrator.py
+patches: list[FilePatch] = []
+if final_code != request.buggy_code:
+    patches.append(
+        FilePatch(
+            file_path=source_file,
+            original_content=request.buggy_code,
+            patched_content=final_code,
+        )
+    )
+```
+
+If the Healer agent's output is byte-for-byte identical to the original input (rare but possible if the bug was in the test rather than the source), `patches` will be an empty list even when `success` is `true`.
+
+## Fields
+
+<ResponseField name="file_path" type="string" required>
+  Relative path of the file within the repository or sandbox workspace (e.g. `"src/utils.py"` or `"target.py"`). Matches the `file_path` supplied in the original `HealRequest`, or the `failing_file` argument for the repository pipeline. This path is used when committing the patch back to the repository via the GitHub App.
+</ResponseField>
+
+<ResponseField name="original_content" type="string" required>
+  The complete, unmodified source code of the file as it existed when the pipeline started. For the single-file pipeline this is always `HealRequest.buggy_code`. For the repository pipeline it is the file content read directly from disk before any Healer agent call.
+</ResponseField>
+
+<ResponseField name="patched_content" type="string" required>
+  The complete, corrected source code produced by the Healer agent and confirmed (directly or via further test runs) to be the best available fix. This is the exact content written back to disk and, in the GitHub App flow, committed to the pull request branch.
+</ResponseField>
+
+## Example FilePatch
+
+The example below shows the patch produced for the compound-interest bug: the Healer agent added `(1 + rate)` in the exponentiation expression and inserted `ValueError` guards for invalid inputs.
+
+```json
+{
+  "file_path": "compound_interest.py",
+  "original_content": "def compound_interest(principal, rate, periods):\n    \"\"\"\n    Return the total accumulated amount after applying compound interest.\n    Formula: A = P * (1 + r) ** n\n    \"\"\"\n    amount = principal * rate ** periods\n    return round(amount, 2)\n",
+  "patched_content": "def compound_interest(principal, rate, periods):\n    \"\"\"\n    Return the total accumulated amount after applying compound interest.\n    Formula: A = P * (1 + r) ** n\n    \"\"\"\n    if principal < 0:\n        raise ValueError(\"principal must be non-negative\")\n    if periods < 0:\n        raise ValueError(\"periods must be non-negative\")\n    amount = principal * (1 + rate) ** periods\n    return round(amount, 2)\n"
+}
+```
+
+## Rendering a Unified Diff
+
+`FilePatch` stores full file contents rather than a unified diff format, which makes it trivial to render a diff programmatically using Python's standard library:
+
+```python
+import difflib
+from app.models.schemas import FilePatch
+
+def render_unified_diff(patch: FilePatch) -> str:
+    original_lines = patch.original_content.splitlines(keepends=True)
+    patched_lines = patch.patched_content.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        original_lines,
+        patched_lines,
+        fromfile=f"a/{patch.file_path}",
+        tofile=f"b/{patch.file_path}",
+        lineterm="",
+    )
+    return "".join(diff)
+```
+
+## Accessing Patches from HealResponse
+
+```python
+from app.models.schemas import HealResponse
+
+response: HealResponse = ...  # result of run_healing_pipeline()
+
+if response.patches:
+    for patch in response.patches:
+        print(f"File:     {patch.file_path}")
+        print(f"Original: {len(patch.original_content)} chars")
+        print(f"Patched:  {len(patch.patched_content)} chars")
+else:
+    print("No files were changed during this healing run.")
+
+# Shortcut: first patch's patched_content is also available as:
+print(response.patched_code)
+```
+
+<Tip>
+  The `patched_code` field on `HealResponse` is automatically populated from `patches[0].patched_content` by `model_post_init`. Use the `patches` list directly when your healing target spans multiple files (e.g. during repository-level healing with AST context).
+</Tip>
+
+## Relationship to the Audit Report
+
+The `patched_content` from each `FilePatch` is embedded verbatim inside the `audit_report` Markdown string, and the `file_path` is used as the code block label. When the GitHub App posts the audit report as a PR comment, reviewers see the full corrected implementation inline without needing to open a separate diff view.
+
+<Warning>
+  `original_content` and `patched_content` are stored as raw strings with no size limit enforced at the schema level. For large source files (> 100 KB), be mindful of the payload size when serializing `HealResponse` to JSON for storage or transmission.
+</Warning>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="HealResponse Schema" icon="file-export" href="/api-reference/schemas/heal-response">
+    The parent schema whose patches list contains all FilePatch records from a run.
+  </Card>
+  <Card title="HealRequest Schema" icon="file-import" href="/api-reference/schemas/heal-request">
+    The input schema whose buggy_code becomes original_content in the resulting patch.
+  </Card>
+  <Card title="LogEntry Schema" icon="list-timeline" href="/api-reference/schemas/log-entry">
+    CODE_PATCHED log entries correspond one-to-one with FilePatch records.
+  </Card>
+</CardGroup>

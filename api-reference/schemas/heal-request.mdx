@@ -1,0 +1,80 @@
+---
+title: "HealRequest — Healing Pipeline Input Payload Schema"
+sidebarTitle: "HealRequest"
+description: "Pydantic input schema that carries the buggy Python source code, functional requirements, and targeting metadata into the AutoFix healing pipeline."
+---
+
+`HealRequest` is the payload you send to the `/heal` endpoint to kick off an autonomous healing run. It bundles the broken source code together with a plain-English description of what the code is supposed to do, giving the Test Engineer agent the full context it needs to synthesize a meaningful `pytest` suite before the first sandbox execution even begins.
+
+## Fields
+
+<ParamField body="language" type="string" default="python">
+  Target programming language for the healing pipeline. AutoFix currently supports `"python"` exclusively; this field is reserved for future multi-language expansion.
+</ParamField>
+
+<ParamField body="buggy_code" type="string" required>
+  The complete source code of the file that needs to be healed. Paste the entire file content — not just the broken function — so the Test Engineer agent has full module-level context (imports, helpers, classes) when generating the test suite.
+</ParamField>
+
+<ParamField body="requirements" type="string" required>
+  A plain-English description of the expected behavior of the target code. The Test Engineer agent uses this as its primary specification when writing assertions. Be specific: list function names, expected return values, edge cases, and error handling semantics you want exercised.
+</ParamField>
+
+<ParamField body="file_path" type="string" default="target.py">
+  Relative file path that the pipeline uses when writing source files into the sandbox workspace directory. Must end in `.py`. If omitted or if the value does not end in `.py`, the orchestrator defaults to `target.py`.
+</ParamField>
+
+## Example Request
+
+The example below shows a realistic `HealRequest` for a buggy Python function that miscalculates compound interest due to a missing `+1` in the base expression.
+
+```json
+{
+  "language": "python",
+  "buggy_code": "def compound_interest(principal, rate, periods):\n    \"\"\"\n    Return the total accumulated amount after applying compound interest.\n    Formula: A = P * (1 + r) ** n\n    \"\"\"\n    amount = principal * rate ** periods\n    return round(amount, 2)\n",
+  "requirements": "The function `compound_interest(principal, rate, periods)` must:\n- Accept a float `principal` (starting balance), float `rate` (per-period interest rate as a decimal, e.g. 0.05 for 5%), and int `periods` (number of compounding periods).\n- Return the total accumulated amount as a float rounded to 2 decimal places.\n- Implement the formula A = P * (1 + r) ** n.\n- Return `principal` unchanged when `rate` is 0 or `periods` is 0.\n- Raise `ValueError` for negative `principal` or negative `periods`.",
+  "file_path": "compound_interest.py"
+}
+```
+
+<Note>
+  The `buggy_code` field should contain the **full file**, not just a snippet. The Test Engineer agent imports the file as a module inside the sandbox, so missing imports or top-level definitions will cause collection errors before any assertion runs.
+</Note>
+
+## Validation Notes
+
+<Accordion title="What happens if file_path doesn't end in .py?">
+  The orchestrator in `app/services/orchestrator.py` checks the extension at runtime:
+
+  ```python
+  source_file = (
+      request.file_path
+      if (request.file_path and request.file_path.endswith(".py"))
+      else "target.py"
+  )
+  ```
+
+  Any value that does not end in `.py` is silently replaced with `target.py`. Always supply a valid Python filename to avoid confusion in the audit report.
+</Accordion>
+
+<Accordion title="How detailed should the requirements field be?">
+  The more specific the requirements, the better the generated test suite. Include:
+
+  - **Function/class names** to test
+  - **Input/output contracts** (types, ranges, return values)
+  - **Edge cases** (empty input, zero, negative numbers, `None`)
+  - **Error conditions** and expected exception types
+
+  Vague requirements like `"the function should work correctly"` produce shallow tests that may miss the actual bug.
+</Accordion>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="HealResponse Schema" icon="file-export" href="/api-reference/schemas/heal-response">
+    The output schema returned by the healing pipeline after all iterations complete.
+  </Card>
+  <Card title="LogEntry Schema" icon="list-timeline" href="/api-reference/schemas/log-entry">
+    Structured trace events emitted at each step of the healing loop.
+  </Card>
+</CardGroup>

@@ -1,0 +1,327 @@
+---
+title: "Orchestrator: Multi-Agent Healing Pipeline Functions"
+sidebarTitle: "Orchestrator"
+description: "Core pipeline functions coordinating the Test Engineer and Healer agents, sandbox execution, and patch iteration to autonomously repair broken Python code."
+---
+
+The orchestrator module is the central coordinator of AutoFix's autonomous repair loop. It exposes two async pipeline functions — one that heals code submitted in memory and one that operates directly on files in a cloned repository — plus utility helpers for parsing pytest output and stripping LLM-generated markdown fences.
+
+## Pipeline Functions
+
+### `run_healing_pipeline()`
+
+Runs the full in-memory multi-agent self-healing pipeline. This is the primary entry point for the `POST /heal` API endpoint. The caller submits broken Python source code and a plain-English requirements description; the function drives every stage from test generation through patch iteration and returns a structured `HealResponse`.
+
+```python
+async def run_healing_pipeline(request: HealRequest) -> HealResponse
+```
+
+<ParamField path="request" type="HealRequest" required>
+  A `HealRequest` object containing:
+  - `buggy_code` — the source code to repair
+  - `requirements` — functional requirements used to generate the test suite
+  - `file_path` — relative filename (`target.py` by default, must end in `.py`)
+  - `language` — target language (`"python"`, default)
+</ParamField>
+
+**Returns:** [`HealResponse`](#healresponse-fields) — the complete result of the healing run.
+
+#### Pipeline Steps
+
+The function emits a `LogEntry` at each named step. You can inspect `response.logs` to trace every decision:
+
+<Steps>
+  <Step title="PIPELINE_INIT">
+    Initialises the `PythonAdapter` sandbox and logs that the pipeline has started.
+  </Step>
+  <Step title="TEST_GENERATION">
+    Calls `call_gemini()` with the **Test Engineer** system prompt. The model receives the requirements and the buggy source code and returns a complete `pytest` suite. The raw LLM output is cleaned through `clean_code_fences()`.
+
+    **Error path →** if `call_gemini()` raises, the step logs `ERROR` and returns a failed `HealResponse` immediately (no iterations consumed).
+  </Step>
+  <Step title="SANDBOX_PREP">
+    Calls `sandbox.clean()` to remove stale artifacts, then `sandbox.write_files()` to write both `target.py` (or the value of `file_path`) and `test_target.py` into `settings.WORKSPACE_DIR`.
+
+    **Error path →** filesystem errors produce an `ERROR` log and an early return.
+  </Step>
+  <Step title="SANDBOX_RUN → TESTS_PASSED / TESTS_FAILED">
+    Runs `sandbox.run_tests()` in a loop (up to `settings.MAX_HEALING_ITERATIONS`). On the first pass the test suite runs against the original buggy code. If all tests pass the loop exits with `success = True`.
+  </Step>
+  <Step title="HEALER_START → CODE_PATCHED">
+    On failure, calls `call_gemini()` with the **Healer** system prompt, passing the current code and the pytest traceback. The healed code is written back to the workspace and the loop continues from `SANDBOX_RUN`.
+
+    **Error path →** an empty patch or an exception logs `ERROR` and breaks the loop.
+  </Step>
+  <Step title="MAX_ITERATIONS_REACHED">
+    Logged when all `MAX_HEALING_ITERATIONS` cycles complete without a passing suite.
+  </Step>
+  <Step title="PIPELINE_COMPLETE">
+    Sandbox is cleaned, the final file is read from disk, `FilePatch` objects and `test_summary` are constructed, the audit report is rendered, and `HealResponse` is returned.
+  </Step>
+</Steps>
+
+#### Usage Example
+
+```python
+import asyncio
+from app.models.schemas import HealRequest
+from app.services.orchestrator import run_healing_pipeline
+
+buggy = """
+def divide(a, b):
+    return a / b          # ZeroDivisionError when b == 0
+"""
+
+requirements = """
+- divide(a, b) must return a / b for non-zero b
+- divide(a, b) must raise ValueError when b is 0
+"""
+
+request = HealRequest(
+    buggy_code=buggy,
+    requirements=requirements,
+    file_path="math_utils.py",
+)
+
+response = asyncio.run(run_healing_pipeline(request))
+
+print(f"Success:    {response.success}")
+print(f"Iterations: {response.iterations_used}")
+print(f"Final code:\n{response.final_code}")
+
+# Inspect the step-by-step execution trace
+for entry in response.logs:
+    print(f"[{entry.step_name}] {entry.message[:80]}")
+```
+
+---
+
+### `run_repo_healing_pipeline()`
+
+Heals Python code that lives on disk inside a repository directory. Instead of receiving code through an API request body, this pipeline reads the target file directly from `repo_dir`, uses `RepoAnalyzer` to build an AST dependency graph for richer context, and runs tests against the real repo layout. This is the function invoked by the GitHub App webhook flow after a PR repo has been cloned.
+
+```python
+async def run_repo_healing_pipeline(
+    repo_dir: Path,
+    language: str = "python",
+    failing_file: str = "target.py",
+    failing_logs: str = "",
+) -> HealResponse
+```
+
+<ParamField path="repo_dir" type="Path" required>
+  Absolute or relative path to the root of the cloned repository directory.
+</ParamField>
+
+<ParamField path="language" type="str" default="python">
+  Target language. Currently only `"python"` is supported; passed through to `RepoAnalyzer` and logged in the response.
+</ParamField>
+
+<ParamField path="failing_file" type="str" default="target.py">
+  Repo-relative path of the file to repair (e.g., `"app/utils/parser.py"`). If the exact path does not exist, the pipeline searches the repo with `rglob` for a file with the same name.
+</ParamField>
+
+<ParamField path="failing_logs" type="str" default="">
+  The pytest / CI output from the initial failure. Passed to the Healer prompt on the first iteration so the model has a concrete error traceback to work from.
+</ParamField>
+
+**Returns:** [`HealResponse`](#healresponse-fields)
+
+#### How It Differs from `run_healing_pipeline()`
+
+| Aspect | `run_healing_pipeline` | `run_repo_healing_pipeline` |
+|---|---|---|
+| Code source | `HealRequest.buggy_code` (in memory) | File read from `repo_dir / failing_file` |
+| Test generation | ✅ Test Engineer agent generates tests | ❌ No test generation — uses existing repo tests |
+| Context enrichment | Minimal (single file) | `RepoAnalyzer.extract_relevant_context()` — full AST graph |
+| Sandbox workspace | `settings.WORKSPACE_DIR` | `repo_dir` itself |
+| Patch write target | `WORKSPACE_DIR / source_file` | `repo_dir / failing_file` (mutates repo on disk) |
+| First iteration | Runs sandbox before any patch | Calls Healer immediately using `failing_logs` |
+
+#### Pipeline Steps (Repo Variant)
+
+<Steps>
+  <Step title="REPO_PIPELINE_INIT">
+    Resolves `repo_dir` to an absolute path, instantiates `PythonAdapter` and `RepoAnalyzer`.
+  </Step>
+  <Step title="AST_CONTEXT_EXTRACTION → AST_CONTEXT_READY">
+    Calls `analyzer.extract_relevant_context()` at `depth=1` to collect the failing file and its direct imports. Failures here are non-fatal — the pipeline continues with an empty context dict.
+  </Step>
+  <Step title="REPO_HEALER_START → REPO_CODE_PATCHED">
+    Constructs a Healer prompt that includes all context file contents, the current version of the failing file, and the failure traceback. Writes the patched code directly back to `target_file_path` on disk.
+  </Step>
+  <Step title="REPO_TEST_RUN → TESTS_PASSED / TESTS_FAILED">
+    Calls `sandbox.run_tests(repo_path, test_file=target_test_file)`. The test file is resolved from conventions (`tests/test_<name>.py`, `test_<name>.py`, etc.). On pass, the loop exits.
+  </Step>
+  <Step title="REPO_PIPELINE_COMPLETE">
+    Sandbox artifacts cleaned, final file read from disk, patches and audit report assembled, `HealResponse` returned.
+  </Step>
+</Steps>
+
+#### Usage Example
+
+```python
+import asyncio
+from pathlib import Path
+from app.services.orchestrator import run_repo_healing_pipeline
+
+# Typically called after GitHubService.clone_repository()
+repo_dir = Path("/tmp/autofix-repos/my-org/my-repo")
+
+failing_logs = """
+FAILED tests/test_parser.py::test_empty_input - AttributeError: 'NoneType' object has no attribute 'strip'
+"""
+
+response = asyncio.run(
+    run_repo_healing_pipeline(
+        repo_dir=repo_dir,
+        language="python",
+        failing_file="app/utils/parser.py",
+        failing_logs=failing_logs,
+    )
+)
+
+if response.success:
+    print("Healing succeeded!")
+    for patch in response.patches:
+        print(f"Patched: {patch.file_path}")
+        print(patch.patched_content)
+else:
+    print(f"Healing failed after {response.iterations_used} iterations.")
+    print(response.failure_logs)
+```
+
+---
+
+## Utility Functions
+
+### `extract_test_summary()`
+
+Parses raw pytest output strings to produce a per-test-case status mapping. Used internally by both pipeline functions to populate `HealResponse.test_summary`.
+
+```python
+def extract_test_summary(
+    failing_logs: str = "",
+    final_output: str = "",
+    test_target: str = "",
+    success: bool = False,
+) -> dict[str, dict[str, str]]
+```
+
+<ParamField path="failing_logs" type="str" default="">
+  Raw pytest stdout/stderr from the **first** (pre-heal) run.
+</ParamField>
+
+<ParamField path="final_output" type="str" default="">
+  Raw pytest stdout/stderr from the **last** run of the healing loop.
+</ParamField>
+
+<ParamField path="test_target" type="str" default="">
+  Fallback test identifier used when no individual test names can be parsed from the logs.
+</ParamField>
+
+<ParamField path="success" type="bool" default="false">
+  Whether the final run passed. Used to infer the final status of tests that appeared in `failing_logs` but not in `final_output`.
+</ParamField>
+
+**Returns:** `dict[str, dict[str, str]]` — keys are pytest node IDs (e.g. `"test_parser.py::test_empty_input"`), values are dicts with `"initial"` and `"final"` status strings (`"Passed ✅"` or `"Failed ❌"`).
+
+```python
+from app.services.orchestrator import extract_test_summary
+
+summary = extract_test_summary(
+    failing_logs="FAILED test_math.py::test_divide_zero",
+    final_output="PASSED test_math.py::test_divide_zero",
+    success=True,
+)
+# {"test_math.py::test_divide_zero": {"initial": "Failed ❌", "final": "Passed ✅"}}
+```
+
+The function uses two regex patterns to handle both pytest output orderings (`name STATUS` and `STATUS name`). If no individual test names are detected, a single synthetic entry keyed to `test_target` is returned.
+
+---
+
+### `clean_code_fences()`
+
+Strips markdown code fences from the raw text returned by Gemini before writing it to a file. Required because LLMs frequently wrap their output in triple-backtick blocks even when instructed not to.
+
+```python
+def clean_code_fences(code: str) -> str
+```
+
+<ParamField path="code" type="str" required>
+  Raw LLM output string, potentially wrapped in one or more ` ```python … ``` ` blocks.
+</ParamField>
+
+**Returns:** `str` — plain source code with all fence markers removed.
+
+The function applies three strategies in order:
+
+1. **Standard fenced block** — matches ` ```lang\n…\n``` ` exactly and returns the inner content.
+2. **Fences within larger text** — finds all fenced blocks with `re.finditer` and returns the content of the longest match.
+3. **Unclosed opening fence** — strips the first line if it starts with ` ``` ` and optionally the last line if it is a bare closing fence.
+
+```python
+from app.services.orchestrator import clean_code_fences
+
+raw = """```python
+def add(a, b):
+    return a + b
+```"""
+
+print(clean_code_fences(raw))
+# def add(a, b):
+#     return a + b
+```
+
+---
+
+## `HealResponse` Fields
+
+<ResponseField name="success" type="bool">
+  `True` if all generated tests passed within the allowed iterations.
+</ResponseField>
+
+<ResponseField name="iterations_used" type="int">
+  Number of heal-and-retest cycles that were executed.
+</ResponseField>
+
+<ResponseField name="final_code" type="str">
+  The final state of the repaired source file (post-heal or original if unchanged).
+</ResponseField>
+
+<ResponseField name="patched_code" type="str">
+  The code patch applied on the last successful heal. Empty string if the original code was never modified.
+</ResponseField>
+
+<ResponseField name="generated_tests" type="str">
+  The `pytest` test suite produced by the Test Engineer agent (`run_healing_pipeline` only).
+</ResponseField>
+
+<ResponseField name="patches" type="list[FilePatch]">
+  List of `FilePatch` objects: `file_path`, `original_content`, `patched_content`. Non-empty only when the code changed.
+</ResponseField>
+
+<ResponseField name="logs" type="list[LogEntry]">
+  Ordered pipeline trace. Each entry has `step_name`, `message`, and `timestamp` (ISO-8601 UTC).
+</ResponseField>
+
+<ResponseField name="test_summary" type="dict[str, dict[str, str]]">
+  Per-test status map built by `extract_test_summary()`. Values contain `"initial"` and `"final"` status strings.
+</ResponseField>
+
+<ResponseField name="audit_report" type="str">
+  Pre-rendered Markdown audit report suitable for posting as a GitHub PR comment.
+</ResponseField>
+
+<ResponseField name="failure_logs" type="str">
+  Raw pytest output from the very first (pre-heal) test run.
+</ResponseField>
+
+<ResponseField name="ast_dependencies" type="list[str]">
+  Repo-relative paths of files included in the AST context scope.
+</ResponseField>
+
+<ResponseField name="model_used" type="str">
+  The Gemini model name that was ultimately used (may differ from `PRIMARY_MODEL` if a fallback was triggered).
+</ResponseField>

@@ -1,47 +1,263 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quickstart: Run AutoFix and Heal Your First Python File"
+sidebarTitle: "Quickstart"
+description: "Clone the repo, configure your Gemini API key, start the FastAPI server, and invoke the healing pipeline on a broken Python function in minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through installing AutoFix locally, configuring the required environment variables, starting the FastAPI development server, and running the self-healing pipeline against a deliberately broken Python function. By the end you will have seen a full healing loop execute — from test generation through code patching to a passing test suite.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure you have the following:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Python 3.11 or newer** — AutoFix uses modern type syntax (`X | None`, `list[T]`) throughout the codebase.
+- **A Google Gemini API key** — Obtain one from [Google AI Studio](https://aistudio.google.com/). The default model is `gemini-3.6-flash`, configurable via `GEMINI_MODEL`.
+- **Git** — Required to clone the repository.
 
-## Get started
+## Installation
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Clone the repository
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+```bash
+git clone https://github.com/ChandanRoy-2004/AutoFix.git
+cd AutoFix
+```
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+### Create and activate a virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
+
+### Install dependencies
+
+All runtime and development dependencies are pinned in `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+The key packages installed are:
+
+| Package | Version | Purpose |
+|---|---|---|
+| `fastapi` | ≥0.115.0 | HTTP API framework |
+| `uvicorn[standard]` | ≥0.30.0 | ASGI server |
+| `pydantic` | ≥2.8.0 | Request/response validation |
+| `pydantic-settings` | ≥2.4.0 | Environment variable configuration |
+| `google-genai` | ≥0.1.1 | Google Gemini AI SDK |
+| `pytest` | ≥8.2.0 | Test execution in the sandbox |
+| `httpx` | ≥0.27.0 | Async HTTP for GitHub API calls |
+| `pyjwt` + `cryptography` | ≥2.8.0 / ≥42.0.0 | GitHub App JWT authentication |
+
+### Configure environment variables
+
+Create a `.env` file in the project root. At minimum, supply your Gemini API key:
+
+```bash
+# .env
+
+# Required — your Google Gemini API key
+GOOGLE_API_KEY=AIza...your_key_here
+
+# Optional — override the default Gemini model
+GEMINI_MODEL=gemini-3.6-flash
+PRIMARY_MODEL=gemini-3.6-flash
+FAST_MODEL=gemini-3.6-flash
+
+# Optional — local workspace directory for sandbox files
+WORKSPACE_DIR=./workspace
+
+# Optional — max self-healing iterations before giving up
+MAX_HEALING_ITERATIONS=3
+
+# Optional — GitHub App credentials (only needed for webhook integration)
+GITHUB_APP_ID=
+GITHUB_PRIVATE_KEY_PATH=
+GITHUB_WEBHOOK_SECRET=
+```
+
+These map directly to the `Settings` class in `app/core/config.py`, which uses `pydantic-settings` to load values from the file automatically:
+
+```python
+class Settings(BaseSettings):
+    GOOGLE_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    PRIMARY_MODEL: str = "gemini-3.6-flash"
+    FAST_MODEL: str = "gemini-3.6-flash"
+    WORKSPACE_DIR: Path = Path("./workspace")
+    MAX_HEALING_ITERATIONS: int = 3
+
+    GITHUB_APP_ID: str = ""
+    GITHUB_PRIVATE_KEY_PATH: str | None = None
+    GITHUB_PRIVATE_KEY_CONTENT: str | None = None
+    GITHUB_WEBHOOK_SECRET: str = ""
+
+    SUPPORTED_LANGUAGES: list[str] = ["python"]
+
+    model_config = SettingsConfigDict(
+        env_file=(".env",),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+```
+
+### Start the development server
+
+```bash
+uvicorn app.main:app --reload
+```
+
+The API will be available at `http://127.0.0.1:8000`. You can verify it is running:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+```json
+{"status": "healthy"}
+```
+
+The auto-generated interactive API docs are available at `http://127.0.0.1:8000/docs`.
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Heal Your First Broken Python File
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+With the server running, you can invoke the healing pipeline programmatically using `run_healing_pipeline`. The example below demonstrates the full flow: a broken `divide` function that does not guard against division by zero.
+
+### The broken code
+
+```python
+# buggy_code — does not handle division by zero
+def divide(a: float, b: float) -> float:
+    return a / b
+
+def average(numbers: list[float]) -> float:
+    return sum(numbers) / len(numbers)
+```
+
+### Invoking the pipeline directly in Python
+
+The orchestrator exposes `run_healing_pipeline` as an `async` function that accepts a `HealRequest` and returns a `HealResponse`. You can call it directly from any async context — for example, from a script or another FastAPI route:
+
+```python
+import asyncio
+from app.models.schemas import HealRequest
+from app.services.orchestrator import run_healing_pipeline
+
+BUGGY_CODE = """
+def divide(a: float, b: float) -> float:
+    return a / b
+
+def average(numbers: list[float]) -> float:
+    return sum(numbers) / len(numbers)
+"""
+
+REQUIREMENTS = """
+- divide(a, b) must return a / b as a float.
+- divide(a, 0) must raise a ValueError with the message 'Cannot divide by zero'.
+- average(numbers) must return the arithmetic mean of a non-empty list.
+- average([]) must raise a ValueError with the message 'Cannot average an empty list'.
+"""
+
+async def main():
+    request = HealRequest(
+        language="python",
+        buggy_code=BUGGY_CODE,
+        requirements=REQUIREMENTS,
+        file_path="target.py",
+    )
+    response = await run_healing_pipeline(request)
+    print(f"Success:        {response.success}")
+    print(f"Iterations used: {response.iterations_used}")
+    print(f"Model used:      {response.model_used}")
+    print(f"\n--- Healed code ---\n{response.final_code}")
+
+asyncio.run(main())
+```
+
+<Note>
+  `run_healing_pipeline` is an `async` function and must be awaited. If you are calling it outside of an existing event loop, wrap it with `asyncio.run()` as shown above.
+</Note>
+
+### The HealRequest schema
+
+`HealRequest` is defined in `app/models/schemas.py`:
+
+```python
+class HealRequest(BaseModel):
+    language: str = Field(default="python")
+    buggy_code: str = Field(..., description="Target source code")
+    requirements: str = Field(..., description="Functional requirements")
+    file_path: str = Field(default="target.py")
+```
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `language` | No | `"python"` | Target language (currently `"python"`) |
+| `buggy_code` | **Yes** | — | The full source of the broken Python file |
+| `requirements` | **Yes** | — | Plain-English functional specification |
+| `file_path` | No | `"target.py"` | Filename written to the sandbox workspace |
+
+### Sample HealResponse
+
+A successful response looks like this:
+
+```json
+{
+  "success": true,
+  "iterations_used": 1,
+  "final_code": "def divide(a: float, b: float) -> float:\n    if b == 0:\n        raise ValueError('Cannot divide by zero')\n    return a / b\n\ndef average(numbers: list[float]) -> float:\n    if not numbers:\n        raise ValueError('Cannot average an empty list')\n    return sum(numbers) / len(numbers)\n",
+  "generated_tests": "import pytest\nfrom target import *\n\ndef test_divide_normal():\n    assert divide(10, 2) == 5.0\n\ndef test_divide_by_zero():\n    with pytest.raises(ValueError, match='Cannot divide by zero'):\n        divide(4, 0)\n\ndef test_average_normal():\n    assert average([1.0, 2.0, 3.0]) == 2.0\n\ndef test_average_empty():\n    with pytest.raises(ValueError, match='Cannot average an empty list'):\n        average([])\n",
+  "language": "python",
+  "patches": [
+    {
+      "file_path": "target.py",
+      "original_content": "...",
+      "patched_content": "..."
+    }
+  ],
+  "logs": [
+    {"step_name": "PIPELINE_INIT",   "message": "AutoFix multi-agent healing pipeline initialized for Python project.", "timestamp": "..."},
+    {"step_name": "TEST_GENERATION", "message": "Test Engineer Agent: Synthesizing pytest suite...", "timestamp": "..."},
+    {"step_name": "SANDBOX_PREP",    "message": "Cleaned sandbox environment and wrote target.py and test_target.py.", "timestamp": "..."},
+    {"step_name": "SANDBOX_RUN",     "message": "Running test suite in sandbox (Iteration #0)...", "timestamp": "..."},
+    {"step_name": "TESTS_FAILED",    "message": "Test execution failed on iteration 1/3:\n...", "timestamp": "..."},
+    {"step_name": "HEALER_START",    "message": "Healer Agent (Iteration 1/3): Analyzing failure logs...", "timestamp": "..."},
+    {"step_name": "CODE_PATCHED",    "message": "Healer Agent (Iteration 1/3): Patched target.py written to sandbox.", "timestamp": "..."},
+    {"step_name": "TESTS_PASSED",    "message": "All test assertions passed successfully on iteration 1!", "timestamp": "..."},
+    {"step_name": "PIPELINE_COMPLETE","message": "Pipeline finished. Success: True, Iterations: 1/3.", "timestamp": "..."}
+  ],
+  "failing_file": "target.py",
+  "model_name": "gemini-3.6-flash",
+  "max_iterations": 3,
+  "ast_dependencies": ["target.py", "test_target.py"],
+  "test_target": "test_target.py",
+  "audit_report": "## 🤖 AutoFix Autonomous Healing Report\n...",
+  "failure_logs": "...",
+  "test_summary": {
+    "test_target.py::test_divide_by_zero": {"initial": "Failed ❌", "final": "Passed ✅"},
+    "test_target.py::test_average_empty":  {"initial": "Failed ❌", "final": "Passed ✅"}
+  }
+}
+```
+
+<Tip>
+  The `audit_report` field contains a fully rendered Markdown report suitable for posting directly as a GitHub PR comment. When the GitHub App integration is active, this report is automatically posted to the PR that triggered the heal.
 </Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="How It Works" icon="diagram-project" href="/how-it-works">
+    Understand every stage of the healing loop in detail — from prompt construction to sandbox cleanup.
+  </Card>
+  <Card title="GitHub Webhooks" icon="github" href="/integrations/github-webhooks">
+    Set up AutoFix as a GitHub App to automatically heal PRs when tests fail in CI.
+  </Card>
+</CardGroup>

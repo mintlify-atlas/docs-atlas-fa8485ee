@@ -1,72 +1,98 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "AutoFix",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#fbde58",
+    "light": "#d0d6d4",
+    "dark": "#fbde58"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/74266794-2b02-44a9-b169-4526a90834d8.png",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/6383466f-1798-4c7d-8192-03ee3395e806.png",
+    "dark": "https://media.brand.dev/6383466f-1798-4c7d-8192-03ee3395e806.png"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ChandanRoy-2004/AutoFix"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/ChandanRoy-2004/AutoFix"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment",
+              "configuration/github-app"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agents",
+              "concepts/sandbox",
+              "concepts/ast-analyzer",
+              "concepts/healing-pipeline"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/github-webhooks",
+              "integrations/gemini-llm"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "REST API",
+            "pages": [
+              "api-reference/overview",
+              "api-reference/health",
+              "api-reference/github-webhook"
+            ]
+          },
+          {
+            "group": "Schemas",
+            "pages": [
+              "api-reference/schemas/heal-request",
+              "api-reference/schemas/heal-response",
+              "api-reference/schemas/log-entry",
+              "api-reference/schemas/file-patch"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "api-reference/services/orchestrator",
+              "api-reference/services/github-service",
+              "api-reference/services/llm-client",
+              "api-reference/services/repo-analyzer",
+              "api-reference/services/sandbox-adapter"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

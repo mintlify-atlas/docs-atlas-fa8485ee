@@ -1,0 +1,104 @@
+---
+title: "AutoFix REST API — Endpoints and Conventions"
+sidebarTitle: "Overview"
+description: "A concise reference for the AutoFix REST API: base URL, authentication model, available endpoints, response conventions, and how to launch the server."
+---
+
+AutoFix exposes a lightweight REST API built on [FastAPI](https://fastapi.tiangolo.com/). Most routes are designed for GitHub App integration — the server listens for webhook events, clones the target repository, runs the autonomous healing pipeline in the background, and posts an audit report back to the pull request. Two utility endpoints (`GET /` and `GET /health`) are always available for liveness and readiness probes.
+
+## Server
+
+Run the FastAPI application locally with Uvicorn:
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+| Environment | Base URL |
+|---|---|
+| Local development | `http://localhost:8000` |
+| Docker / remote host | `http://<host>:8000` |
+
+Once the server is running, FastAPI automatically generates interactive documentation:
+
+- **Swagger UI** — [`http://localhost:8000/docs`](http://localhost:8000/docs)
+- **ReDoc** — [`http://localhost:8000/redoc`](http://localhost:8000/redoc)
+
+Both UIs reflect the live schema, including all request bodies, response models, and validation rules derived from the Pydantic schemas defined in `app/models/schemas.py`.
+
+## Content Type
+
+All request bodies and response payloads use `application/json`. Include the header on any request that sends a body:
+
+```http
+Content-Type: application/json
+```
+
+## Authentication
+
+Most endpoints require **no authentication**. The single exception is the GitHub webhook endpoint, which optionally enforces HMAC SHA-256 signature verification when `GITHUB_WEBHOOK_SECRET` is set in the environment.
+
+When the secret is configured, GitHub signs every webhook delivery with an `X-Hub-Signature-256` header of the form:
+
+```
+X-Hub-Signature-256: sha256=<hex-digest>
+```
+
+The server computes `HMAC-SHA256(secret, raw_request_body)` and uses a constant-time `hmac.compare_digest()` check to prevent timing attacks. A missing or invalid signature returns `401 Unauthorized`. If `GITHUB_WEBHOOK_SECRET` is left empty, signature verification is skipped entirely and all deliveries are accepted.
+
+<Note>
+  Signature verification is performed against the **raw bytes** of the request body before JSON parsing. Any middleware that re-encodes or normalises the body will break signature validation.
+</Note>
+
+## Available Endpoints
+
+<CardGroup cols={2}>
+  <Card title="Health Checks" icon="heart-pulse" href="/api-reference/health">
+    `GET /` and `GET /health` — confirm the engine is live and suitable for container
+    liveness probes. No authentication required.
+  </Card>
+  <Card title="GitHub Webhook" icon="webhook" href="/api-reference/github-webhook">
+    `POST /api/github/webhook` — receives GitHub pull-request events, verifies the
+    HMAC signature, and enqueues the healing pipeline as a background task.
+  </Card>
+</CardGroup>
+
+## Response Conventions
+
+All responses are JSON objects. AutoFix follows these conventions throughout the API:
+
+| Convention | Detail |
+|---|---|
+| **Success status** | `200 OK` for all successful requests, including webhook ingestion |
+| **Accepted-but-async** | Background tasks return `{"status": "accepted"}` immediately; the pipeline runs asynchronously |
+| **Validation errors** | FastAPI returns `422 Unprocessable Entity` with a structured `detail` array when request data fails Pydantic validation |
+| **Auth failures** | `401 Unauthorized` with a plain `detail` string (`"Missing signature"` or `"Invalid signature"`) |
+| **No envelope** | Response bodies are flat JSON objects — there is no wrapper `data` or `result` key |
+
+### Example: accepted webhook response
+
+```json
+{
+  "status": "accepted"
+}
+```
+
+### Example: 401 error response
+
+```json
+{
+  "detail": "Invalid signature"
+}
+```
+
+## Application Metadata
+
+The FastAPI application is initialised with the following metadata (visible in `/docs` and `/redoc`):
+
+```python
+app = FastAPI(
+    title="AutoFix Engine",
+    description="Autonomous AST-based code healing engine",
+    version="1.0.0"
+)
+```

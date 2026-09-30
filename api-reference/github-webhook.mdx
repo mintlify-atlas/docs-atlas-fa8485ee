@@ -1,0 +1,274 @@
+---
+title: "POST /api/github/webhook — PR Healing Trigger"
+sidebarTitle: "GitHub Webhook"
+description: "Reference for POST /api/github/webhook: HMAC-SHA256 signature verification, accepted pull-request actions, background healing pipeline, and error codes."
+---
+
+The webhook endpoint is the primary integration point between GitHub and AutoFix. When GitHub delivers a `pull_request` event to this endpoint, AutoFix verifies the payload signature, enqueues the healing pipeline as a background task, and immediately returns `{"status": "accepted"}`. The pipeline then clones the repository, runs the Test Engineer and Healer agents, and posts a full audit report back to the PR as a comment.
+
+## Endpoint
+
+```
+POST /api/github/webhook
+```
+
+---
+
+## Request Headers
+
+<ParamField header="X-GitHub-Event" type="string" required>
+  The GitHub event type. Only `pull_request` events trigger the healing pipeline. All other event types are silently acknowledged with `{"status": "accepted"}` and no action is taken.
+</ParamField>
+
+<ParamField header="X-Hub-Signature-256" type="string">
+  HMAC SHA-256 signature of the raw request body, prefixed with `sha256=`. This header is **required when `GITHUB_WEBHOOK_SECRET` is set** in the AutoFix environment. GitHub generates this header automatically for all webhook deliveries when a secret is configured in the GitHub App or repository webhook settings.
+
+  Format: `sha256=<64-character-hex-digest>`
+
+  Example: `sha256=d9e4f3a1b2c5...`
+</ParamField>
+
+<ParamField header="Content-Type" type="string" required>
+  Must be `application/json`. GitHub webhook deliveries always set this header.
+</ParamField>
+
+---
+
+## Accepted Pull Request Actions
+
+The endpoint inspects the `action` field of the `pull_request` payload. The healing pipeline is only enqueued for the following actions:
+
+| Action | When it fires |
+|---|---|
+| `opened` | A new pull request is created |
+| `synchronize` | New commits are pushed to an existing PR's branch |
+| `reopened` | A previously closed PR is reopened |
+
+Any other `pull_request` action (e.g. `closed`, `labeled`, `review_requested`) is acknowledged and ignored.
+
+---
+
+## Signature Verification
+
+When `GITHUB_WEBHOOK_SECRET` is set, the server verifies every delivery using HMAC-SHA256:
+
+```python
+def verify_signature(payload: bytes, signature: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    expected_signature = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected_signature, signature)
+```
+
+The comparison uses `hmac.compare_digest()` for constant-time equality, preventing timing-based attacks. Verification is performed against the **raw request bytes** before any JSON parsing.
+
+<Warning>
+  If `GITHUB_WEBHOOK_SECRET` is configured but the `X-Hub-Signature-256` header is absent, the server returns `401 Unauthorized` immediately — even if the payload is otherwise valid. Always configure the same secret value in both the GitHub App settings and your AutoFix environment.
+</Warning>
+
+---
+
+## Successful Response
+
+When the payload is valid and the event is accepted, the server returns HTTP `200` immediately. The healing pipeline executes asynchronously in a background task — the response does **not** wait for healing to complete.
+
+```json
+{
+  "status": "accepted"
+}
+```
+
+<ResponseField name="status" type="string" required>
+  Always `"accepted"` on a successful ingestion. This value confirms the payload passed signature verification and the background task was enqueued — it does not indicate whether healing succeeded.
+</ResponseField>
+
+---
+
+## Error Responses
+
+<ResponseField name="detail" type="string">
+  Present on `401` errors. Describes the reason authentication failed.
+</ResponseField>
+
+| HTTP Status | `detail` value | Cause |
+|---|---|---|
+| `401 Unauthorized` | `"Missing signature"` | `GITHUB_WEBHOOK_SECRET` is set but `X-Hub-Signature-256` header was not sent |
+| `401 Unauthorized` | `"Invalid signature"` | The provided signature does not match the HMAC of the raw body |
+| `422 Unprocessable Entity` | *(FastAPI validation detail array)* | The JSON body failed Pydantic schema validation |
+
+---
+
+## Example: Simulating a Webhook Delivery
+
+The following `curl` command replicates a GitHub webhook delivery for a newly-opened pull request. Replace `<YOUR_SECRET>` with the value of `GITHUB_WEBHOOK_SECRET`, and replace the payload with your own event data.
+
+<Note>
+  GitHub computes the signature over the exact raw bytes it transmits. When testing manually, compute the HMAC against the exact JSON string you send — any whitespace difference will cause a signature mismatch.
+</Note>
+
+<Steps>
+  <Step title="Save the payload to a file">
+    Write your sample payload to `pr_event.json` so the same bytes are used for both the HMAC computation and the request body:
+
+    ```bash
+    cat > pr_event.json << 'EOF'
+    {
+      "action": "opened",
+      "number": 42,
+      "pull_request": {
+        "number": 42,
+        "title": "Fix divide-by-zero in calculator",
+        "labels": [
+          { "name": "bug" }
+        ]
+      },
+      "repository": {
+        "full_name": "your-org/your-repo",
+        "clone_url": "https://github.com/your-org/your-repo.git"
+      },
+      "sender": {
+        "login": "octocat"
+      },
+      "installation": {
+        "id": 12345678
+      }
+    }
+    EOF
+    ```
+  </Step>
+
+  <Step title="Compute the HMAC-SHA256 signature">
+    Generate the signature using `openssl`:
+
+    ```bash
+    SIGNATURE="sha256=$(openssl dgst -sha256 -hmac "<YOUR_SECRET>" pr_event.json | awk '{print $2}')"
+    echo $SIGNATURE
+    # sha256=d9e4f3a1b2c5...
+    ```
+  </Step>
+
+  <Step title="Send the webhook request">
+    Deliver the payload with all required GitHub headers:
+
+    ```bash
+    curl -s -X POST http://localhost:8000/api/github/webhook \
+      -H "Content-Type: application/json" \
+      -H "X-GitHub-Event: pull_request" \
+      -H "X-Hub-Signature-256: $SIGNATURE" \
+      --data-binary @pr_event.json
+    ```
+  </Step>
+
+  <Step title="Inspect the response">
+    A correctly signed delivery returns:
+
+    ```json
+    {
+      "status": "accepted"
+    }
+    ```
+
+    The healing pipeline is now running as a background task. Check server logs for progress.
+  </Step>
+</Steps>
+
+---
+
+## Webhook Payload Structure
+
+The endpoint expects a standard GitHub `pull_request` event payload. The fields AutoFix actively reads are:
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | PR action — must be `opened`, `synchronize`, or `reopened` |
+| `pull_request.number` | `integer` | PR number used in audit report and comment posting |
+| `pull_request.labels` | `array` | Label objects; each must have a `name` string field |
+| `repository.full_name` | `string` | `owner/repo` slug — logged and used for repository operations |
+| `sender.login` | `string` | GitHub username of the actor who triggered the event |
+| `installation.id` | `integer` | GitHub App installation ID, used to generate an installation access token |
+| `installation_token` | `string` | *(Optional)* Pre-fetched token; masked in audit logs if present |
+
+---
+
+## Audit Event Format
+
+Once ingested, the webhook payload is normalised into a structured audit record by `format_pr_audit_event()` in `app/utils/event_formatter.py`. This record is included in pipeline logs and the PR comment:
+
+```python
+def format_pr_audit_event(event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Formats incoming webhook payloads into structured internal audit logs."""
+    ...
+    return {
+        "event": event_type,
+        "repo": repo_name,
+        "pr_number": pr_number,
+        "sender": sender,
+        "label_count": len(labels),
+        "auth_trace": masked_token,
+        "status": "INGESTED"
+    }
+```
+
+<ResponseField name="event" type="string">
+  The GitHub event type string passed to the formatter, e.g. `"pull_request"`.
+</ResponseField>
+
+<ResponseField name="repo" type="string">
+  The `full_name` of the repository (`"owner/repo"`), extracted from `payload.repository.full_name`.
+</ResponseField>
+
+<ResponseField name="pr_number" type="integer">
+  The pull request number, extracted from `payload.pull_request.number`.
+</ResponseField>
+
+<ResponseField name="sender" type="string">
+  The GitHub login of the user who triggered the event, extracted from `payload.sender.login`.
+</ResponseField>
+
+<ResponseField name="label_count" type="integer">
+  The number of labels attached to the pull request at the time the event was received.
+</ResponseField>
+
+<ResponseField name="auth_trace" type="string">
+  A masked representation of the installation token, if present in the payload. Tokens are masked to `<first 4 chars>...<last 4 chars>` by `sanitize_installation_token()`. Shows `"NONE"` when no token is present.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Always `"INGESTED"` at ingestion time. Indicates the event was successfully parsed and passed to the audit system.
+</ResponseField>
+
+### Example audit record
+
+```json
+{
+  "event": "pull_request",
+  "repo": "your-org/your-repo",
+  "pr_number": 42,
+  "sender": "octocat",
+  "label_count": 1,
+  "auth_trace": "ghs_...n4Kz",
+  "status": "INGESTED"
+}
+```
+
+---
+
+## Background Task Behaviour
+
+<Accordion title="What happens after the webhook is accepted?">
+  After returning `{"status": "accepted"}`, FastAPI continues executing the `process_webhook_event` coroutine as a background task. The full sequence is:
+
+  1. **Repository clone** — the GitHub App installation token is used to authenticate a clone of the target repository at the PR's head SHA.
+  2. **AST analysis** — `RepoAnalyzer` builds a dependency graph of the changed files using Python's `ast` module.
+  3. **Test generation** — the Test Engineer agent prompts Gemini to produce a `pytest` suite for the failing code.
+  4. **Sandbox execution** — tests are run in an isolated Python subprocess via `PythonAdapter`.
+  5. **Healing loop** — if tests fail, the Healer agent patches the code and re-runs tests, up to `MAX_HEALING_ITERATIONS` times.
+  6. **Audit report** — `build_healing_audit_report()` compiles a Markdown report.
+  7. **PR comment** — the report is posted to the pull request as a review comment via the GitHub API.
+</Accordion>
+
+<Tip>
+  To monitor background task progress in real time, tail the server logs with `uvicorn app.main:app --log-level info`. Each pipeline step emits a structured log entry with the `autofix` logger name.
+</Tip>

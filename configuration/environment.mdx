@@ -1,0 +1,155 @@
+---
+title: "Environment Variables & Configuration Reference"
+sidebarTitle: "Environment"
+description: "Complete reference for every environment variable AutoFix reads from .env via Pydantic BaseSettings, including types, defaults, and configuration guidance."
+---
+
+AutoFix loads all configuration at startup through a Pydantic `BaseSettings` class defined in `app/core/config.py`. Variables are read from a `.env` file at the project root (or from the shell environment directly), making it straightforward to run AutoFix locally, in Docker, or on any cloud platform without changing application code.
+
+<Note>
+  `WORKSPACE_DIR` is resolved to an absolute path and **created automatically** at startup via the `resolve_workspace_dir` field validator — you never need to `mkdir` it manually.
+</Note>
+
+## Core AI Settings
+
+These variables control which Google Gemini models AutoFix uses for test generation and code healing.
+
+<ParamField body="GOOGLE_API_KEY" type="string" required>
+  Your Google Gemini API key. Obtain one from [Google AI Studio](https://aistudio.google.com/app/apikey). This key is used for every call to the Gemini API — both test generation and healing agents authenticate with it.
+</ParamField>
+
+<ParamField body="GEMINI_MODEL" type="string" default="gemini-3.6-flash">
+  The primary Gemini model identifier used for healing operations. This is the legacy alias that maps to the same model as `PRIMARY_MODEL`. Both may be set independently to allow gradual migration between model versions.
+</ParamField>
+
+<ParamField body="PRIMARY_MODEL" type="string" default="gemini-3.6-flash">
+  The primary Gemini model used by the Healer agent (`app/agents/healer.py`) to generate and apply code patches. Also used when building PR audit reports to record which model was responsible for a heal.
+</ParamField>
+
+<ParamField body="FAST_MODEL" type="string" default="gemini-3.6-flash">
+  The Gemini model used by the Test Engineer agent (`app/agents/test_engineer.py`) for fast, low-latency test suite generation. Separate from `PRIMARY_MODEL` so you can point test generation at a cheaper or faster model while keeping a higher-quality model for healing.
+</ParamField>
+
+## Execution Sandbox
+
+<ParamField body="WORKSPACE_DIR" type="Path" default="./workspace">
+  The local directory where AutoFix writes temporary Python files, generated test suites, and patch outputs before executing them in an isolated subprocess sandbox. Relative paths are resolved against the repository root. The directory is created (with `parents=True`) automatically on startup — no manual setup is needed.
+</ParamField>
+
+<ParamField body="MAX_HEALING_ITERATIONS" type="integer" default="3">
+  The maximum number of heal-and-test cycles AutoFix will attempt before giving up and returning the best available result. Higher values give the model more attempts to converge but increase latency and API cost. Applies to both the direct API pipeline (`run_healing_pipeline`) and the GitHub PR pipeline (`run_repo_healing_pipeline`).
+</ParamField>
+
+## GitHub App Integration
+
+These variables are required only when using AutoFix as a GitHub App that reacts to pull request webhooks. Leave them unset for standalone API usage.
+
+<ParamField body="GITHUB_APP_ID" type="string">
+  The numeric App ID shown on your GitHub App's settings page (e.g., `"123456"`). AutoFix embeds this as the `iss` claim in the RS256 JWT it generates to authenticate with the GitHub API. If left empty, JWT generation is skipped and GitHub integration is disabled.
+</ParamField>
+
+<ParamField body="GITHUB_PRIVATE_KEY_PATH" type="string | null" default="null">
+  Filesystem path to the `.pem` private key file downloaded from your GitHub App's settings. Accepts both absolute paths and paths relative to the project root. AutoFix checks both the current working directory and the repository base directory when resolving relative paths. Mutually exclusive with `GITHUB_PRIVATE_KEY_CONTENT` — if both are set, the inline content takes precedence.
+</ParamField>
+
+<ParamField body="GITHUB_PRIVATE_KEY_CONTENT" type="string | null" default="null">
+  The full PEM-encoded private key as an inline string. Ideal for secret-manager injection, Docker secrets, and CI/CD pipelines where mounting a file is inconvenient. Literal `\n` escape sequences are automatically converted to real newlines. **Takes precedence over `GITHUB_PRIVATE_KEY_PATH`** when both are present.
+</ParamField>
+
+<ParamField body="GITHUB_WEBHOOK_SECRET" type="string">
+  The HMAC secret you configure in GitHub's webhook settings. AutoFix uses it to verify the `X-Hub-Signature-256` header on every incoming webhook request (`HMAC-SHA256`). If this value is empty, signature verification is skipped — **do not leave it empty in production**.
+</ParamField>
+
+## Language Support
+
+<ParamField body="SUPPORTED_LANGUAGES" type="list[string]" default='["python"]'>
+  A JSON-encoded list of programming language identifiers that AutoFix accepts in `HealRequest` payloads. Currently only `"python"` is fully implemented (backed by `PythonAdapter` in `app/services/sandboxes/adapters.py`), but the list-based design anticipates future language adapters.
+</ParamField>
+
+---
+
+## Sample `.env` File
+
+Copy this template to the project root as `.env` and fill in the required values before starting AutoFix.
+
+```ini .env
+# ──────────────────────────────────────────────
+# AutoFix — Environment Configuration
+# ──────────────────────────────────────────────
+
+# Required: Google Gemini API key
+GOOGLE_API_KEY=your-google-api-key-here
+
+# Gemini model identifiers (all default to gemini-3.6-flash)
+GEMINI_MODEL=gemini-3.6-flash
+PRIMARY_MODEL=gemini-3.6-flash
+FAST_MODEL=gemini-3.6-flash
+
+# Sandbox execution directory (auto-created on startup)
+WORKSPACE_DIR=./workspace
+
+# Maximum heal-and-test cycles per request
+MAX_HEALING_ITERATIONS=3
+
+# Supported languages (JSON array)
+SUPPORTED_LANGUAGES=["python"]
+
+# ──────────────────────────────────────────────
+# GitHub App Integration (optional)
+# Leave blank to run AutoFix in standalone mode.
+# ──────────────────────────────────────────────
+
+GITHUB_APP_ID=
+GITHUB_PRIVATE_KEY_PATH=./keys/autofix-app.private-key.pem
+# Or provide the key inline (takes precedence over the path):
+# GITHUB_PRIVATE_KEY_CONTENT=-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----
+
+GITHUB_WEBHOOK_SECRET=your-webhook-hmac-secret
+```
+
+---
+
+## Variable Precedence
+
+AutoFix follows standard Pydantic `BaseSettings` precedence (highest → lowest):
+
+<Steps>
+  <Step title="Shell Environment">
+    Variables already present in the process environment (e.g., set via `export` or injected by Docker / Kubernetes) take top priority.
+  </Step>
+  <Step title=".env at Project Root">
+    The `.env` file at `BASE_DIR/.env` is loaded next. Values here are ignored when the same key is already in the environment.
+  </Step>
+  <Step title=".env in Working Directory">
+    A second `.env` in the current working directory is consulted last, which helps when running commands from a sub-directory.
+  </Step>
+  <Step title="Field Defaults">
+    Pydantic `BaseSettings` field defaults (shown above) are used when a variable is absent from all three sources above.
+  </Step>
+</Steps>
+
+<Tip>
+  Variable names are **case-insensitive** (`model_config = SettingsConfigDict(case_sensitive=False)`), so `google_api_key` and `GOOGLE_API_KEY` are treated identically.
+</Tip>
+
+---
+
+## Configuration Quick Reference
+
+| Variable | Type | Default | Required |
+|---|---|---|---|
+| `GOOGLE_API_KEY` | `str` | — | ✅ Yes |
+| `GEMINI_MODEL` | `str` | `gemini-3.6-flash` | No |
+| `PRIMARY_MODEL` | `str` | `gemini-3.6-flash` | No |
+| `FAST_MODEL` | `str` | `gemini-3.6-flash` | No |
+| `WORKSPACE_DIR` | `Path` | `./workspace` | No |
+| `MAX_HEALING_ITERATIONS` | `int` | `3` | No |
+| `GITHUB_APP_ID` | `str` | `""` | GitHub only |
+| `GITHUB_PRIVATE_KEY_PATH` | `str \| None` | `null` | GitHub only |
+| `GITHUB_PRIVATE_KEY_CONTENT` | `str \| None` | `null` | GitHub only |
+| `GITHUB_WEBHOOK_SECRET` | `str` | `""` | GitHub only |
+| `SUPPORTED_LANGUAGES` | `list[str]` | `["python"]` | No |
+
+<Warning>
+  Never commit a populated `.env` file to version control. Add `.env` to your `.gitignore` and store secrets in a dedicated secret manager (AWS Secrets Manager, GitHub Actions secrets, HashiCorp Vault, etc.).
+</Warning>

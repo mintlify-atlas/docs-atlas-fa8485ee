@@ -1,0 +1,292 @@
+---
+title: "GitHub App Setup & Webhook Integration Guide"
+sidebarTitle: "GitHub App"
+description: "Register a GitHub App, configure permissions, wire up webhook signature verification, and understand how AutoFix authenticates with RS256 JWT to heal pull requests."
+---
+
+AutoFix's GitHub integration works as a **GitHub App** — a first-class GitHub identity with fine-grained repository permissions, installation-scoped access tokens, and verified webhook delivery. When a pull request is opened or updated, GitHub sends a signed webhook event to AutoFix, which then clones the branch, runs the healing pipeline, commits any patches, and posts a structured audit report as a PR comment — all without storing long-lived OAuth tokens.
+
+This guide walks through every step, from registering the App on GitHub to verifying that webhook events are arriving correctly.
+
+---
+
+## Step 1 — Create the GitHub App
+
+<Steps>
+  <Step title="Open the GitHub App registration form">
+    Navigate to **GitHub → Settings → Developer settings → GitHub Apps → New GitHub App**  
+    (or for an organisation: **Org Settings → Developer settings → GitHub Apps**).
+  </Step>
+
+  <Step title="Fill in the basic details">
+    | Field | Value |
+    |---|---|
+    | **GitHub App name** | `AutoFix` (or any unique name) |
+    | **Homepage URL** | Your AutoFix deployment URL, e.g. `https://autofix.example.com` |
+    | **Webhook URL** | The public URL of your AutoFix webhook endpoint: `https://autofix.example.com/github/webhook` |
+    | **Webhook secret** | A strong random string — copy it, you will set it as `GITHUB_WEBHOOK_SECRET` |
+  </Step>
+
+  <Step title="Configure repository permissions">
+    Under **Permissions → Repository permissions**, set:
+
+    | Permission | Level |
+    |---|---|
+    | **Contents** | `Read & write` — required to clone branches and push patches |
+    | **Pull requests** | `Read & write` — required to post audit report comments |
+
+    Leave all other permissions at their defaults (`No access`).
+  </Step>
+
+  <Step title="Subscribe to pull request events">
+    Under **Subscribe to events**, check **Pull request**. AutoFix reacts to three actions:
+    - `opened` — a new PR is created
+    - `synchronize` — new commits are pushed to an existing PR
+    - `reopened` — a previously closed PR is reopened
+
+    ```python app/api/github_routes.py (excerpt)
+    if event_type == "pull_request" and payload.get("action") in [
+        "opened",
+        "synchronize",
+        "reopened",
+    ]:
+        background_tasks.add_task(process_webhook_event, payload)
+    ```
+  </Step>
+
+  <Step title="Finish and record the App ID">
+    Click **Create GitHub App**. On the confirmation page, copy the numeric **App ID** — you will set it as `GITHUB_APP_ID`.
+  </Step>
+</Steps>
+
+---
+
+## Step 2 — Generate the Private Key
+
+AutoFix signs RS256 JWTs using a private key that belongs exclusively to your GitHub App. GitHub holds only the matching public key.
+
+<Steps>
+  <Step title="Download the private key">
+    On your App's settings page, scroll to **Private keys** and click **Generate a private key**. GitHub downloads a `.pem` file to your machine.
+  </Step>
+
+  <Step title="Choose a delivery method">
+    AutoFix supports two ways to supply the key. Pick the one that suits your deployment:
+
+    <Tabs>
+      <Tab title="File path (local / VM)">
+        Copy the `.pem` file into your project (e.g., `keys/autofix-app.private-key.pem`) and set:
+
+        ```ini .env
+        GITHUB_PRIVATE_KEY_PATH=./keys/autofix-app.private-key.pem
+        ```
+
+        AutoFix resolves relative paths against both the current working directory and the repository root (`BASE_DIR`), so either location works.
+      </Tab>
+      <Tab title="Inline content (CI / containers)">
+        Paste the full PEM text — including the `-----BEGIN RSA PRIVATE KEY-----` header and footer — as an environment variable or secret. Literal `\n` sequences in the value are automatically converted to real newlines:
+
+        ```ini .env
+        GITHUB_PRIVATE_KEY_CONTENT=-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----
+        ```
+
+        <Note>
+          `GITHUB_PRIVATE_KEY_CONTENT` takes precedence over `GITHUB_PRIVATE_KEY_PATH` when both are set. The inline approach is preferred for Docker, Kubernetes Secrets, and GitHub Actions.
+        </Note>
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
+
+---
+
+## Step 3 — Set Environment Variables
+
+With the App ID, private key, and webhook secret in hand, update your `.env`:
+
+```ini .env
+# GitHub App credentials
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_PATH=./keys/autofix-app.private-key.pem
+GITHUB_WEBHOOK_SECRET=your-strong-random-secret
+```
+
+Or, for a containerised deployment that injects secrets from a vault:
+
+```ini .env
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_CONTENT=-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----
+GITHUB_WEBHOOK_SECRET=your-strong-random-secret
+```
+
+Refer to the [Environment Variables reference](/configuration/environment) for the full list of accepted values and precedence rules.
+
+---
+
+## Step 4 — Install the App on a Repository
+
+A GitHub App must be **installed** on a repository before it can access that repository's code or receive its webhook events.
+
+<Steps>
+  <Step title="Navigate to the install page">
+    On your App's settings page, click **Install App** in the left sidebar, then choose the account (personal or organisation) and click **Install**.
+  </Step>
+
+  <Step title="Select repositories">
+    Choose **Only select repositories** and pick the repos you want AutoFix to monitor. GitHub will grant the App the permissions you configured in Step 1 only for those repositories.
+  </Step>
+
+  <Step title="Record the installation ID">
+    After installation, the URL in your browser changes to:  
+    `https://github.com/settings/installations/<installation_id>`  
+    AutoFix receives the `installation.id` field in every webhook payload, so you do not need to hard-code it.
+  </Step>
+</Steps>
+
+---
+
+## Step 5 — JWT Authentication Flow
+
+When AutoFix needs to act on a repository (clone it, commit patches, or post comments), it first exchanges its private key for a short-lived **installation access token** via GitHub's App authentication flow.
+
+```
+┌──────────┐    RS256 JWT (10 min)    ┌──────────────────────────────────────┐
+│ AutoFix  │ ───────────────────────► │  POST /app/installations/{id}/       │
+│  Server  │                          │            access_tokens             │
+│          │ ◄─────────────────────── │  GitHub API                          │
+│          │  installation token      └──────────────────────────────────────┘
+│          │  (1 hr, repo-scoped)
+└──────────┘
+```
+
+The JWT payload contains three claims:
+
+| Claim | Value | Purpose |
+|---|---|---|
+| `iss` | `GITHUB_APP_ID` | Identifies the GitHub App |
+| `iat` | `now` (Unix epoch) | Issued-at timestamp |
+| `exp` | `now + 600` | Expires in 10 minutes |
+
+Here is the exact implementation from `app/services/github_service.py`:
+
+```python app/services/github_service.py
+def _generate_jwt(self) -> str:
+    """Generate and sign a RS256 JWT valid for 10 minutes for GitHub App authentication."""
+    key_text: str | None = settings.GITHUB_PRIVATE_KEY_CONTENT or os.environ.get(
+        "GITHUB_PRIVATE_KEY_CONTENT"
+    )
+
+    if not key_text and settings.GITHUB_PRIVATE_KEY_PATH:
+        key_path = Path(settings.GITHUB_PRIVATE_KEY_PATH)
+        if not key_path.is_absolute():
+            potential_paths = [key_path, (BASE_DIR / key_path).resolve()]
+            found = next(
+                (p for p in potential_paths if p.exists() and p.is_file()), None
+            )
+            if found:
+                key_text = found.read_text(encoding="utf-8")
+        elif key_path.exists() and key_path.is_file():
+            key_text = key_path.read_text(encoding="utf-8")
+
+    if not key_text:
+        raise ValueError("No GitHub App private key found in environment or file path.")
+
+    key_text = key_text.replace("\\n", "\n")
+
+    now = int(time.time())
+    payload = {
+        "iat": now,
+        "exp": now + 600,
+        "iss": str(settings.GITHUB_APP_ID),
+    }
+    encoded_jwt = jwt.encode(payload, key_text, algorithm="RS256")
+    if isinstance(encoded_jwt, bytes):
+        encoded_jwt = encoded_jwt.decode("utf-8")
+    return encoded_jwt
+```
+
+Once the JWT is generated, AutoFix POSTs it to GitHub to obtain an installation-scoped token:
+
+```python app/services/github_service.py
+async def get_installation_access_token(self, installation_id: int) -> str:
+    """Fetch an installation access token using GitHub App JWT authentication."""
+    jwt_token = self.generate_jwt()
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=headers)
+        if response.status_code == 201:
+            data = response.json()
+            return data.get("token", "")
+```
+
+The installation token is then injected into the git `clone` URL and used as the `Authorization: token …` header when posting PR comments, keeping credentials out of log files.
+
+---
+
+## Step 6 — Webhook Signature Verification
+
+Every request GitHub sends to `/github/webhook` includes an `X-Hub-Signature-256` header containing an HMAC-SHA256 digest of the raw request body, keyed with `GITHUB_WEBHOOK_SECRET`. AutoFix verifies this signature before processing any event.
+
+```python app/api/github_routes.py
+def verify_signature(payload: bytes, signature: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    expected_signature = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected_signature, signature)
+
+
+@router.post("/webhook")
+async def github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: str = Header(None),
+):
+    payload_bytes = await request.body()
+
+    if WEBHOOK_SECRET and not x_hub_signature_256:
+        raise HTTPException(status_code=401, detail="Missing signature")
+
+    if x_hub_signature_256 and not verify_signature(payload_bytes, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    ...
+```
+
+<Warning>
+  If `GITHUB_WEBHOOK_SECRET` is empty, **all** incoming webhook requests are accepted without verification. Always configure a non-empty secret in production — an open webhook endpoint is a remote code execution risk.
+</Warning>
+
+The verification logic follows GitHub's recommendations exactly:
+
+1. Read the **raw bytes** of the request body before any JSON parsing.
+2. Compute `HMAC-SHA256(secret, body)` and prefix the result with `sha256=`.
+3. Use `hmac.compare_digest` for a **constant-time** comparison to prevent timing attacks.
+
+---
+
+## Troubleshooting
+
+<Accordion title="AutoFix returns 401 Unauthorized on webhook delivery">
+  Check that `GITHUB_WEBHOOK_SECRET` in your `.env` exactly matches the secret you entered in the GitHub App's webhook settings — including case and any trailing whitespace. You can redeliver a webhook from the **Advanced** tab of your App's settings to test without creating a new PR.
+</Accordion>
+
+<Accordion title="JWT generation fails with 'No GitHub App private key found'">
+  AutoFix raises this error when neither `GITHUB_PRIVATE_KEY_CONTENT` nor `GITHUB_PRIVATE_KEY_PATH` resolves to a readable file. Verify that:
+  - `GITHUB_PRIVATE_KEY_PATH` points to the correct `.pem` file (relative to the project root or as an absolute path).
+  - `GITHUB_PRIVATE_KEY_CONTENT` does not have extra leading/trailing whitespace.
+  - The file has read permissions for the user running AutoFix.
+</Accordion>
+
+<Accordion title="Installation token request returns 404 or 403">
+  This usually means the App is not installed on the repository that triggered the webhook. Go to **Settings → Applications → Installed GitHub Apps** and confirm AutoFix is listed with access to the relevant repository.
+</Accordion>
+
+<Accordion title="Patches are committed but the PR comment is missing">
+  The `post_pr_comment` method requires `Pull requests: Read & write` permission. Re-check the App's permissions and, if you changed them after initial installation, accept the updated permissions from the installation page.
+</Accordion>

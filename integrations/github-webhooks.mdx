@@ -1,0 +1,348 @@
+---
+title: "GitHub Webhook Integration: PR Auto-Healing Flow"
+sidebarTitle: "GitHub Webhooks"
+description: "Connect AutoFix to GitHub as a GitHub App. Receive PR webhooks, verify HMAC signatures, clone repos, heal code, and post audit comments automatically."
+---
+
+AutoFix integrates with GitHub through a native GitHub App webhook listener. When a pull request is opened, synchronized, or reopened, GitHub sends a signed `pull_request` event to AutoFix. The service verifies the HMAC SHA-256 signature, offloads processing to a background task, and orchestrates the full repository healing pipeline — cloning the PR branch, running tests, diagnosing failures, applying patches, and posting a structured audit report back to the PR as a comment.
+
+## Webhook Endpoint
+
+The webhook receiver lives at `/api/github/webhook` and is mounted under the `github_routes` API router.
+
+```http
+POST /api/github/webhook
+```
+
+### Required Headers
+
+| Header | Type | Description |
+| :--- | :--- | :--- |
+| `X-GitHub-Event` | `string` | GitHub event type. AutoFix processes `pull_request` events. |
+| `X-Hub-Signature-256` | `string` | HMAC SHA-256 signature in the form `sha256=<hex>`. Required when `GITHUB_WEBHOOK_SECRET` is set. |
+| `Content-Type` | `string` | Must be `application/json`. |
+
+### Response
+
+A successful delivery always returns `200 OK` with a minimal JSON acknowledgement body. Heavy processing happens asynchronously.
+
+```json
+{ "status": "accepted" }
+```
+
+---
+
+## Supported Events and Actions
+
+AutoFix only reacts to `pull_request` webhook events. Within that event type, only three actions trigger the healing pipeline:
+
+| Action | Description |
+| :--- | :--- |
+| `opened` | A brand-new PR was created against the repository. |
+| `synchronize` | New commits were pushed to an existing PR branch. |
+| `reopened` | A previously closed PR was re-opened. |
+
+All other actions (e.g., `labeled`, `closed`, `review_requested`) are silently ignored and the endpoint still returns `200 { "status": "accepted" }`.
+
+```python
+if event_type == "pull_request" and payload.get("action") in ["opened", "synchronize", "reopened"]:
+    logger.info(f"Received PR event for repository: {payload.get('repository', {}).get('full_name')}")
+    background_tasks.add_task(process_webhook_event, payload)
+```
+
+---
+
+## Signature Verification
+
+AutoFix verifies every incoming webhook using HMAC SHA-256 to prevent spoofed requests. The shared secret is configured via the `GITHUB_WEBHOOK_SECRET` environment variable.
+
+### How `verify_signature()` Works
+
+```python
+def verify_signature(payload: bytes, signature: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    expected_signature = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected_signature, signature)
+```
+
+The function:
+1. Reads the raw request body **bytes** (before any JSON parsing) to guarantee byte-exact matching.
+2. Computes `HMAC-SHA256(secret, body)` and prepends the `sha256=` prefix, exactly matching GitHub's format.
+3. Uses `hmac.compare_digest()` for a **constant-time comparison** that prevents timing side-channel attacks.
+4. Returns `True` unconditionally when `GITHUB_WEBHOOK_SECRET` is empty — useful during local development.
+
+### Failure Cases
+
+```python
+if WEBHOOK_SECRET and not x_hub_signature_256:
+    raise HTTPException(status_code=401, detail="Missing signature")
+
+if x_hub_signature_256 and not verify_signature(payload_bytes, x_hub_signature_256):
+    raise HTTPException(status_code=401, detail="Invalid signature")
+```
+
+<Warning>
+  If `GITHUB_WEBHOOK_SECRET` is not set, **all requests are accepted without verification**. Always set this variable in production to prevent unauthorized pipeline triggers.
+</Warning>
+
+---
+
+## Background Task Processing
+
+FastAPI's `BackgroundTasks` mechanism is used so the webhook endpoint returns `200 { "status": "accepted" }` immediately — before any heavy I/O begins. GitHub requires a response within 10 seconds or it will retry the delivery.
+
+```python
+@router.post("/webhook")
+async def github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: str = Header(None)
+):
+    ...
+    if event_type == "pull_request" and payload.get("action") in ["opened", "synchronize", "reopened"]:
+        background_tasks.add_task(process_webhook_event, payload)
+
+    return {"status": "accepted"}
+```
+
+`process_webhook_event(payload)` receives the full parsed webhook payload and is responsible for extracting installation credentials, cloning the repository branch, and invoking `run_repo_healing_pipeline()`.
+
+---
+
+## Sample Webhook Payload
+
+Below is a representative `pull_request` event with `action: opened` as sent by GitHub.
+
+```json
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "title": "Fix order processor edge cases",
+    "state": "open",
+    "head": {
+      "ref": "fix/order-processor",
+      "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    },
+    "base": {
+      "ref": "main"
+    },
+    "labels": []
+  },
+  "repository": {
+    "id": 123456789,
+    "full_name": "acme-corp/backend-service",
+    "clone_url": "https://github.com/acme-corp/backend-service.git",
+    "default_branch": "main"
+  },
+  "installation": {
+    "id": 99887766
+  },
+  "sender": {
+    "login": "dev-alice"
+  }
+}
+```
+
+<Note>
+  The `installation.id` field is critical. AutoFix uses it to exchange a GitHub App JWT for a short-lived installation access token, which authenticates the repository clone and the eventual patch push.
+</Note>
+
+---
+
+## End-to-End Flow
+
+The complete journey from a developer opening a PR to AutoFix posting the healed result:
+
+<Steps>
+  <Step title="PR Event Received">
+    A developer opens, pushes to, or reopens a pull request. GitHub sends a signed `POST /api/github/webhook` with `X-GitHub-Event: pull_request`.
+  </Step>
+  <Step title="Signature Verified">
+    AutoFix reads the raw body bytes and recomputes `HMAC-SHA256(GITHUB_WEBHOOK_SECRET, body)`. If the `X-Hub-Signature-256` header does not match, the request is rejected with `401 Invalid signature`. Otherwise the endpoint returns `200 { "status": "accepted" }` immediately.
+  </Step>
+  <Step title="Background Task Queued">
+    The action is checked against `["opened", "synchronize", "reopened"]`. A matching event schedules `process_webhook_event(payload)` as a FastAPI background task so the HTTP response is not held open.
+  </Step>
+  <Step title="Installation Token Fetched">
+    `GitHubService.get_installation_access_token(installation_id)` generates a short-lived RS256 JWT from the GitHub App private key and POSTs to `https://api.github.com/app/installations/{id}/access_tokens` to obtain a scoped token.
+  </Step>
+  <Step title="Repository Cloned">
+    `GitHubService.clone_repository()` performs a shallow `git clone --depth 1 -b {pr_branch}` of the PR head branch into a local workspace directory, authenticated via `https://x-access-token:{token}@github.com/...`.
+  </Step>
+  <Step title="AST Context Extracted">
+    `RepoAnalyzer.extract_relevant_context()` builds an AST dependency graph of the failing file, walking imports to gather all directly related modules within the repo.
+  </Step>
+  <Step title="Healing Pipeline Runs">
+    `run_repo_healing_pipeline()` is invoked. The Healer Agent analyzes failure logs alongside the AST context, generates a patch via `call_gemini()`, writes it to disk, and re-runs the test suite in a sandboxed subprocess — looping up to `MAX_HEALING_ITERATIONS` times.
+  </Step>
+  <Step title="Patch Committed and Pushed">
+    When tests pass, `GitHubService.commit_and_push_patch()` stages all changes, commits with message `AutoFix: healed {file}`, re-authenticates the git remote, and pushes to the PR branch.
+  </Step>
+  <Step title="Audit Report Posted">
+    `GitHubService.post_pr_comment()` calls `build_healing_audit_report()` to render a structured Markdown table and posts it to the PR via `POST https://api.github.com/repos/{repo}/issues/{pr}/comments`.
+  </Step>
+</Steps>
+
+---
+
+## The GitHubService Class
+
+`GitHubService` encapsulates all GitHub API interactions. Key methods:
+
+<AccordionGroup>
+  <Accordion title="generate_jwt() — GitHub App Authentication">
+    Generates a 10-minute RS256 JWT signed with the app's private key. The key is loaded from `GITHUB_PRIVATE_KEY_CONTENT` (inline PEM string) or `GITHUB_PRIVATE_KEY_PATH` (file path), with support for both absolute and BASE_DIR-relative paths.
+
+    ```python
+    payload = {
+        "iat": now,
+        "exp": now + 600,
+        "iss": str(settings.GITHUB_APP_ID),
+    }
+    encoded_jwt = jwt.encode(payload, key_text, algorithm="RS256")
+    ```
+  </Accordion>
+
+  <Accordion title="get_installation_access_token() — Scoped Token Exchange">
+    Uses the JWT to POST to the GitHub App installations endpoint and returns a short-lived installation access token scoped to the specific repository installation.
+
+    ```python
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="clone_repository() — Authenticated Shallow Clone">
+    Composes an authenticated HTTPS URL of the form `https://x-access-token:{token}@github.com/{repo}.git` and runs `git clone -b {branch} --depth 1`.
+
+    ```python
+    auth_url = f"https://x-access-token:{token}@{repo_url[8:]}"
+    cmd = ["git", "clone", "-b", branch, "--depth", "1", auth_url, str(target_path)]
+    ```
+  </Accordion>
+
+  <Accordion title="commit_and_push_patch() — Patched Code Push">
+    Configures `AutoFix Bot` as the git identity, stages all changes, checks for actual modifications via `git status --porcelain`, commits, and pushes. If no changes are detected the method returns `True` without creating a no-op commit.
+  </Accordion>
+
+  <Accordion title="post_pr_comment() — Audit Report Delivery">
+    Accepts either a rendered Markdown string or a `HealResponse` object. For structured objects it calls `build_healing_audit_report()` to render the Markdown before posting to the GitHub Issues Comments API.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Audit Report Format
+
+After the healing pipeline completes, AutoFix posts a structured Markdown comment to the pull request. The comment is built by `build_healing_audit_report()` in `app/services/github_service.py`.
+
+### Sample Audit Report Comment
+
+````markdown
+## 🤖 AutoFix Autonomous Healing Report
+
+| Metric | Status |
+| :--- | :--- |
+| **Status** | Verified Passing ✅ |
+| **Iterations Required** | `2 / 3` |
+| **Target Module** | `order_processor.py` |
+| **LLM Engine** | `gemini-3.6-flash` |
+
+---
+
+### 🔍 AST Dependency Scope
+The following interdependent modules were extracted and analyzed to preserve system contracts:
+- `order_processor.py`
+- `utils/validators.py`
+
+---
+
+### 🧪 Test Verification Suite
+| Test Target | Initial Run | Sandbox Verification |
+| :--- | :---: | :---: |
+| `tests/test_order_processor.py::test_discount_logic` | Failed ❌ | Passed ✅ |
+| `tests/test_order_processor.py::test_empty_cart` | Failed ❌ | Passed ✅ |
+
+---
+
+<details>
+<summary><b>View Applied Code Patch</b></summary>
+
+```python
+def calculate_total(items: list, discount: float = 0.0) -> float:
+    if not items:
+        return 0.0
+    subtotal = sum(item["price"] * item["qty"] for item in items)
+    return round(subtotal * (1 - discount), 2)
+```
+</details>
+
+<details>
+<summary><b>View Initial Failure Logs & Traceback</b></summary>
+
+```text
+FAILED tests/test_order_processor.py::test_discount_logic - AssertionError: 90.0 != 88.0
+```
+</details>
+````
+
+### Failure Log Truncation
+
+To keep PR comments within readable limits, `truncate_failure_logs()` caps failure output at **30 lines** or **2000 characters**, preserving the most recent (most relevant) lines of the stack trace.
+
+---
+
+## Webhook Event Audit Formatting
+
+`format_pr_audit_event()` in `app/utils/event_formatter.py` converts raw webhook payloads into structured internal audit records. It extracts the repository name, PR number, sender login, and PR labels, and masks any embedded installation tokens using `sanitize_installation_token()`.
+
+```python
+def format_pr_audit_event(event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    ...
+    return {
+        "event": event_type,
+        "repo": repo_name,
+        "pr_number": pr_number,
+        "sender": sender,
+        "label_count": len(labels),
+        "auth_trace": masked_token,   # e.g. "ghs_...xYzW"
+        "status": "INGESTED"
+    }
+```
+
+`sanitize_installation_token()` returns the first 4 and last 4 characters of the token separated by `...`, or `****` for tokens shorter than 8 characters — ensuring tokens never appear in plaintext in logs.
+
+---
+
+## Configuration Reference
+
+All GitHub App settings are loaded from environment variables via `app/core/config.py`.
+
+<ParamField body="GITHUB_APP_ID" type="string" required>
+  The numeric ID of your registered GitHub App. Used as the `iss` claim when generating JWTs.
+</ParamField>
+
+<ParamField body="GITHUB_PRIVATE_KEY_CONTENT" type="string">
+  PEM-encoded private key as an inline string. Takes precedence over `GITHUB_PRIVATE_KEY_PATH`. Escape newlines as `\n` when setting via environment variable.
+</ParamField>
+
+<ParamField body="GITHUB_PRIVATE_KEY_PATH" type="string">
+  Filesystem path to the `.pem` private key file. Supports paths relative to the project root (`BASE_DIR`).
+</ParamField>
+
+<ParamField body="GITHUB_WEBHOOK_SECRET" type="string">
+  Shared secret configured in the GitHub App webhook settings. Used to verify `X-Hub-Signature-256`. Omit only in local development.
+</ParamField>
+
+<Tip>
+  Set `GITHUB_PRIVATE_KEY_CONTENT` rather than `GITHUB_PRIVATE_KEY_PATH` in containerized or serverless deployments where filesystem access to key files is unreliable.
+</Tip>

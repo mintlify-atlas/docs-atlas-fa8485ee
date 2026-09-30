@@ -1,0 +1,381 @@
+---
+title: "GitHubService: App Auth, Clone, Patch, and PR Comments"
+sidebarTitle: "GitHub Service"
+description: "GitHubService class and module helpers for GitHub App JWT auth, repository cloning, committing healed patches, and posting audit reports as PR comments."
+---
+
+The `GitHubService` class encapsulates every interaction AutoFix needs with the GitHub API and `git` CLI: authenticating as a GitHub App, cloning repositories, committing and pushing patches produced by the healing pipeline, and posting Markdown audit reports as pull request comments. Two module-level helpers — `build_healing_audit_report()` and `truncate_failure_logs()` — handle formatting and safe log truncation independently of the class.
+
+## Class: `GitHubService`
+
+```python
+from app.services.github_service import GitHubService
+
+svc = GitHubService()
+```
+
+The constructor stores no configuration itself. All credentials are read from the `settings` object (populated from environment variables or `.env`). See the [Configuration](/configuration/github-app) page for the required `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_PATH` / `GITHUB_PRIVATE_KEY_CONTENT`, and `GITHUB_WEBHOOK_SECRET` variables.
+
+---
+
+### `generate_jwt()`
+
+Generates a short-lived RS256 JSON Web Token signed with the GitHub App private key. The token is valid for **10 minutes** and is required as a bearer credential for all GitHub App API calls.
+
+```python
+def generate_jwt(self) -> str
+```
+
+**Returns:** `str` — the encoded JWT, or an empty string if the private key is not configured or an error occurs (errors are logged but not re-raised).
+
+The method resolves the private key from two sources in priority order:
+
+1. `settings.GITHUB_PRIVATE_KEY_CONTENT` (raw PEM string, supports `\\n`-escaped newlines)
+2. `settings.GITHUB_PRIVATE_KEY_PATH` (path to a `.pem` file, checked relative to both `cwd` and the project `BASE_DIR`)
+
+```python
+svc = GitHubService()
+jwt_token = svc.generate_jwt()
+# "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+<Note>
+  GitHub App JWTs expire after 10 minutes. Call `generate_jwt()` immediately before each API request rather than caching the result across requests.
+</Note>
+
+---
+
+### `get_installation_access_token()`
+
+Exchanges a GitHub App JWT for a short-lived installation access token scoped to a specific app installation. Installation tokens are used to authenticate `git clone`, `git push`, and all repository API calls.
+
+```python
+async def get_installation_access_token(self, installation_id: int) -> str
+```
+
+<ParamField path="installation_id" type="int" required>
+  The numeric installation ID delivered in the `installation.id` field of every GitHub App webhook payload.
+</ParamField>
+
+**Returns:** `str` — the installation access token, or an empty string on failure.
+
+Makes a `POST` request to `https://api.github.com/app/installations/{installation_id}/access_tokens` and returns the `token` field from the `201 Created` response.
+
+```python
+token = await svc.get_installation_access_token(installation_id=12345678)
+# "ghs_abc123..."
+```
+
+---
+
+### `clone_repo()`
+
+Clones a single remote branch using `git clone --depth 1`. An optional access token is injected into the remote URL as `x-access-token:<token>@github.com/…` so the clone authenticates without requiring a configured SSH key.
+
+```python
+def clone_repo(
+    self,
+    repo_url: str,
+    branch: str,
+    target_dir: Path,
+    token: str = "",
+) -> bool
+```
+
+<ParamField path="repo_url" type="str" required>
+  Full HTTPS URL of the repository, e.g. `"https://github.com/my-org/my-repo.git"`.
+</ParamField>
+
+<ParamField path="branch" type="str" required>
+  Branch name to clone, e.g. `"fix/handle-null-parser"`.
+</ParamField>
+
+<ParamField path="target_dir" type="Path" required>
+  Destination directory path. The parent directory is created automatically if it does not exist.
+</ParamField>
+
+<ParamField path="token" type="str" default="">
+  GitHub installation access token. When provided, the URL is rewritten to embed the credential before calling `git clone`.
+</ParamField>
+
+**Returns:** `bool` — `True` on success, `False` on non-zero git exit code or exception. The raw returncode and stderr are stored in `self.last_clone_returncode` and `self.last_clone_stderr` for debugging.
+
+---
+
+### `clone_repository()`
+
+Higher-level async wrapper around `clone_repo()`. Accepts either an already-obtained token or an `installation_id` to fetch a fresh token automatically.
+
+```python
+async def clone_repository(
+    self,
+    repo_full_name: str,
+    branch: str,
+    destination: Path,
+    installation_id: int | None = None,
+    token: str = "",
+) -> bool
+```
+
+<ParamField path="repo_full_name" type="str" required>
+  `"owner/repo"` slug (e.g. `"my-org/my-repo"`). If the value already starts with `"http"` it is used as-is as the URL.
+</ParamField>
+
+<ParamField path="branch" type="str" required>
+  Branch to clone.
+</ParamField>
+
+<ParamField path="destination" type="Path" required>
+  Local directory where the repo will be placed.
+</ParamField>
+
+<ParamField path="installation_id" type="int | None" default="None">
+  If `token` is empty and `installation_id` is provided, `get_installation_access_token()` is called to obtain a token before cloning.
+</ParamField>
+
+<ParamField path="token" type="str" default="">
+  Pre-obtained installation access token. Takes priority over `installation_id`.
+</ParamField>
+
+**Returns:** `bool`
+
+---
+
+### `commit_and_push_patch()`
+
+Stages all changes in `repo_dir`, creates a commit with the given message under the `AutoFix Bot` identity, and pushes to the named branch. If the token is provided the remote `origin` URL is rewritten to embed it before pushing.
+
+```python
+def commit_and_push_patch(
+    self,
+    repo_dir: Path,
+    branch: str,
+    commit_message: str,
+    token: str = "",
+) -> bool
+```
+
+<ParamField path="repo_dir" type="Path" required>
+  Local path to the cloned repository. Must exist and be a git repository.
+</ParamField>
+
+<ParamField path="branch" type="str" required>
+  Name of the remote branch to push to.
+</ParamField>
+
+<ParamField path="commit_message" type="str" required>
+  Git commit message, e.g. `"fix(parser): handle None input — AutoFix patch"`.
+</ParamField>
+
+<ParamField path="token" type="str" default="">
+  Installation access token used to authenticate the push. Optional if the remote is already authenticated.
+</ParamField>
+
+**Returns:** `bool` — `True` if the push succeeded or if there were no changes to commit; `False` otherwise.
+
+<Warning>
+  `commit_and_push_patch()` directly modifies `repo_dir` on disk. Call it only after the healing pipeline has confirmed `response.success == True` to avoid pushing broken code.
+</Warning>
+
+---
+
+### `post_pr_comment()`
+
+Posts a Markdown comment to a GitHub pull request (or issue). Accepts either a pre-rendered Markdown string or a `HealResponse` object — in the latter case, `build_healing_audit_report()` is called automatically to render the report.
+
+```python
+async def post_pr_comment(
+    self,
+    repo_full_name: str,
+    pr_number: int,
+    comment_markdown: Any = None,
+    token: str = "",
+    *,
+    comment_or_metadata: Any = None,
+) -> bool
+```
+
+<ParamField path="repo_full_name" type="str" required>
+  `"owner/repo"` slug.
+</ParamField>
+
+<ParamField path="pr_number" type="int" required>
+  Pull request (or issue) number.
+</ParamField>
+
+<ParamField path="comment_markdown" type="str | HealResponse | None" default="None">
+  Either a rendered Markdown string to post directly, or a `HealResponse` object whose `audit_report` field (or auto-rendered report) will be used.
+</ParamField>
+
+<ParamField path="token" type="str" default="">
+  GitHub installation access token with `pull_requests: write` permission.
+</ParamField>
+
+**Returns:** `bool` — `True` on `HTTP 201 Created`, `False` otherwise.
+
+---
+
+### `format_pr_comment()`
+
+Static method. Returns the pre-rendered `audit_report` string from a `HealResponse`, falling back to calling `build_healing_audit_report()` if the field is empty.
+
+```python
+@staticmethod
+def format_pr_comment(heal_response: HealResponse) -> str
+```
+
+---
+
+## Module-Level Functions
+
+### `build_healing_audit_report()`
+
+Constructs the structured Markdown audit report that is posted to pull requests. Can be driven entirely by a `HealResponse` object, by individual keyword arguments, or by a mix of both. All parameters are optional — the function resolves each value from `heal_response` when a keyword argument is `None`.
+
+```python
+def build_healing_audit_report(
+    heal_response=None,
+    *,
+    status: str | None = None,
+    iteration: int | None = None,
+    max_iterations: int | None = None,
+    failing_file: str | None = None,
+    model_name: str | None = None,
+    ast_dependencies: list[str] | dict | None = None,
+    formatted_ast_tree: str | None = None,
+    test_target: str | None = None,
+    test_rows: str | None = None,
+    test_summary: dict | None = None,
+    patched_code: str | None = None,
+    language: str | None = None,
+    failure_logs: str | None = None,
+    truncated_failure_logs: str | None = None,
+) -> str
+```
+
+**Returns:** `str` — a complete Markdown document ready for `post_pr_comment()`.
+
+The rendered report contains:
+
+- A summary table: status, iterations used, target module, LLM engine
+- **AST Dependency Scope** — bullet list of files analysed
+- **Test Verification Suite** — table of test IDs with initial and final run status
+- A collapsible `<details>` block containing the applied code patch
+- An optional collapsible `<details>` block containing the truncated initial failure logs
+
+```python
+from app.services.github_service import build_healing_audit_report
+from app.services.orchestrator import run_healing_pipeline
+from app.models.schemas import HealRequest
+
+request = HealRequest(
+    buggy_code="def divide(a, b): return a / b",
+    requirements="raise ValueError when b == 0",
+)
+response = await run_healing_pipeline(request)
+
+# Build from HealResponse directly
+report = build_healing_audit_report(response)
+print(report)
+
+# Or build from explicit kwargs
+report = build_healing_audit_report(
+    status="Verified Passing ✅",
+    iteration=2,
+    max_iterations=3,
+    failing_file="math_utils.py",
+    model_name="gemini-3.6-flash",
+    language="python",
+    patched_code="def divide(a, b):\n    if b == 0:\n        raise ValueError('...')\n    return a / b",
+)
+```
+
+---
+
+### `truncate_failure_logs()`
+
+Trims failure log strings so they stay within GitHub PR comment size limits. Truncation preserves the **tail** of the log (most recent lines / characters) to keep stack traces intact.
+
+```python
+def truncate_failure_logs(
+    logs: str,
+    max_lines: int = 30,
+    max_chars: int = 2000,
+) -> str
+```
+
+<ParamField path="logs" type="str" required>
+  Raw pytest or CI failure output string.
+</ParamField>
+
+<ParamField path="max_lines" type="int" default="30">
+  Maximum number of lines to retain (counts from the end of the string).
+</ParamField>
+
+<ParamField path="max_chars" type="int" default="2000">
+  Maximum character count after line truncation (also taken from the end).
+</ParamField>
+
+**Returns:** `str` — the truncated and stripped log, or an empty string if `logs` is falsy.
+
+---
+
+## End-to-End Usage Example
+
+The following snippet shows the complete GitHub App integration flow: authenticate, clone, heal, push, comment.
+
+```python
+import asyncio
+from pathlib import Path
+from app.services.github_service import GitHubService
+from app.services.orchestrator import run_repo_healing_pipeline
+
+async def handle_pr_failure(
+    repo_full_name: str,
+    pr_number: int,
+    branch: str,
+    failing_file: str,
+    failing_logs: str,
+    installation_id: int,
+):
+    svc = GitHubService()
+
+    # 1. Obtain short-lived installation token
+    token = await svc.get_installation_access_token(installation_id)
+
+    # 2. Clone the PR branch
+    repo_dir = Path(f"/tmp/autofix/{repo_full_name}/{branch}")
+    cloned = await svc.clone_repository(
+        repo_full_name=repo_full_name,
+        branch=branch,
+        destination=repo_dir,
+        token=token,
+    )
+    if not cloned:
+        return
+
+    # 3. Run the repo healing pipeline
+    response = await run_repo_healing_pipeline(
+        repo_dir=repo_dir,
+        failing_file=failing_file,
+        failing_logs=failing_logs,
+    )
+
+    if response.success:
+        # 4. Commit and push the patch
+        await asyncio.to_thread(
+            svc.commit_and_push_patch,
+            repo_dir=repo_dir,
+            branch=branch,
+            commit_message=f"fix: auto-heal {failing_file} — AutoFix patch",
+            token=token,
+        )
+
+    # 5. Post the audit report as a PR comment
+    await svc.post_pr_comment(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        comment_or_metadata=response,
+        token=token,
+    )
+```

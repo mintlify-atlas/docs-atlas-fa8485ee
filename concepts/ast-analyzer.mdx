@@ -1,0 +1,296 @@
+---
+title: "AST Dependency Analyzer: Repository Context Extraction"
+sidebarTitle: "AST Analyzer"
+description: "How RepoAnalyzer builds a Python import graph from raw AST nodes, then performs BFS traversal to supply the Healer Agent with relevant module context."
+---
+
+When AutoFix operates on a full repository rather than a single pasted file, it needs to give the Healer Agent more than just the broken module. A bug in `app/services/order_processor.py` might stem from a contract defined in `app/models/schemas.py` three imports away. The `RepoAnalyzer` class solves this by parsing every Python file's AST, building a dependency graph across the entire repository, and returning a targeted slice of that graph centred on the failing file.
+
+## Class Overview
+
+```python
+# app/services/repo_analyzer.py
+
+class RepoAnalyzer:
+    """Python AST dependency analyzer for extracting import graphs and
+    localized context from repositories."""
+```
+
+`RepoAnalyzer` has no constructor arguments and holds no state — each method call is independent. All three public methods are designed to be composed in sequence: `scan_python_dependencies()` feeds into `build_dependency_graph()`, which feeds into `extract_relevant_context()`.
+
+---
+
+## `scan_python_dependencies()`
+
+Parses a single Python file's AST and returns the set of all module names it imports.
+
+```python
+def scan_python_dependencies(self, file_path: Path) -> set[str]:
+    """Parse Python source code using AST and extract imported module names and symbols."""
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `file_path` | `Path` | Absolute or relative path to the `.py` file to parse |
+
+**Returns** — `set[str]` of raw import strings. For example, a file containing:
+
+```python
+import logging
+from app.models.schemas import HealRequest, HealResponse
+from pathlib import Path
+```
+
+…returns:
+
+```python
+{
+    "logging",
+    "app.models.schemas",
+    "app.models.schemas.HealRequest",
+    "app.models.schemas.HealResponse",
+    "pathlib",
+    "Path",
+}
+```
+
+**AST node types handled:**
+
+```python
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        # `import logging` → adds "logging"
+        for alias in node.names:
+            if alias.name:
+                dependencies.add(alias.name)
+
+    elif isinstance(node, ast.ImportFrom):
+        # `from app.models.schemas import HealRequest` →
+        #   adds "app.models.schemas"
+        #   adds "app.models.schemas.HealRequest"
+        #   adds "HealRequest"
+        module = node.module or ""
+        if module:
+            dependencies.add(module)
+        for alias in node.names:
+            if alias.name and alias.name != "*":
+                if module:
+                    dependencies.add(f"{module}.{alias.name}")
+                dependencies.add(alias.name)
+```
+
+If the file is unreadable, contains a syntax error, or cannot be decoded as UTF-8, the method returns an empty set and logs a debug-level warning rather than raising an exception.
+
+---
+
+## `build_dependency_graph()`
+
+Scans every `.py` file in a repository and constructs a full import dependency graph.
+
+```python
+def build_dependency_graph(
+    self,
+    repo_dir: Path,
+    language: str = "python",
+) -> dict[str, list[str]]:
+    """Recursively scan repo_dir strictly for Python (.py) source files
+    and map imports using native AST."""
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `repo_dir` | `Path` | Root directory of the repository to scan |
+| `language` | `str` | Reserved for future use; currently always `"python"` |
+
+**Returns** — `dict[str, list[str]]` mapping each repo-relative file path to the sorted list of repo-relative paths it imports. Keys and values use POSIX slash notation, e.g.:
+
+```python
+{
+    "app/services/orchestrator.py": [
+        "app/core/config.py",
+        "app/models/schemas.py",
+        "app/services/llm_client.py",
+        "app/services/repo_analyzer.py",
+        "app/services/sandboxes/adapters.py",
+    ],
+    "app/agents/healer.py": [
+        "app/core/config.py",
+        "app/core/prompt_templates.py",
+        "app/services/llm_client.py",
+    ],
+    ...
+}
+```
+
+### Excluded directories
+
+The following directory names are always filtered out during the recursive scan:
+
+```python
+ignored_dirs = {
+    ".git",
+    ".pytest_cache",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+}
+```
+
+Any `.py` file whose relative path contains one of these directory names as a path component is skipped entirely.
+
+### Three-strategy dependency resolution
+
+For each raw import string collected by `scan_python_dependencies()`, the graph builder tries three matching strategies in order:
+
+1. **Module notation match** — `"app.models.schemas"` → `"app/models/schemas.py"` via a pre-built lookup table
+2. **Stem match** — `"schemas"` → any file whose stem is `schemas`, e.g. `"app/models/schemas.py"`
+3. **Path conversion** — `"app.models.schemas"` → replace `.` with `/`, append `.py`, check if `"app/models/schemas.py"` exists in the file map
+
+This layered approach handles both fully qualified imports and bare name imports that are common in intra-package code.
+
+---
+
+## `extract_relevant_context()`
+
+The primary entry point for the healing pipeline. Runs a BFS traversal of the import graph to collect a targeted set of file contents centred on the failing file.
+
+```python
+def extract_relevant_context(
+    self,
+    repo_dir: Path,
+    failing_file: str,
+    language: str = "python",
+    depth: int = 1,
+) -> dict[str, str]:
+    """Extract contents of the failing Python file and its connected
+    AST dependencies up to depth."""
+```
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `repo_dir` | `Path` | — | Root directory of the repository |
+| `failing_file` | `str` | — | Relative path to the file that needs healing (e.g. `"app/services/order_processor.py"`) |
+| `language` | `str` | `"python"` | Reserved; always `"python"` |
+| `depth` | `int` | `1` | BFS hop limit — how many import edges to traverse away from the failing file |
+
+**Returns** — `dict[str, str]` mapping repo-relative file paths to their full source code content:
+
+```python
+{
+    "app/services/order_processor.py": "# full source of the failing file\n...",
+    "app/models/schemas.py": "# full source of the schemas module\n...",
+    "app/core/config.py": "# full source of config\n...",
+}
+```
+
+### BFS traversal logic
+
+The traversal explores both **forward** (files the failing file imports) and **reverse** (files that import the failing file) edges at each BFS step:
+
+```python
+queue: deque[tuple[str, int]] = deque([(matched_failing_key, 0)])
+selected_files.add(matched_failing_key)
+
+while queue:
+    current_node, current_depth = queue.popleft()
+    if current_depth < depth:
+        neighbors = (
+            set(graph.get(current_node, []))          # forward edges
+            | set(reverse_graph.get(current_node, [])) # reverse edges
+        )
+        for nbr in neighbors:
+            if nbr not in selected_files:
+                selected_files.add(nbr)
+                queue.append((nbr, current_depth + 1))
+```
+
+With `depth=1` (the default used by `run_repo_healing_pipeline()`), the context includes the failing file itself plus every module it directly imports and every module that directly imports it. Increasing `depth` widens the context window at the cost of a larger prompt.
+
+### Fallback for unresolved files
+
+If the failing file is not present in the graph (e.g. it is a newly created file with no imports yet), `extract_relevant_context()` still attempts to read it directly from disk:
+
+```python
+direct_file = (repo_path / norm_failing).resolve()
+if direct_file.exists() and direct_file.is_file():
+    selected_files.add(norm_failing)
+```
+
+<Tip>
+  The `depth` parameter is the primary knob for controlling prompt size vs. context richness. Start with `depth=1` for most repositories. Increase to `depth=2` only when the healing agent repeatedly misses bugs that originate in transitive dependencies.
+</Tip>
+
+---
+
+## How the Healer Uses This Context
+
+In `run_repo_healing_pipeline()`, the orchestrator passes the context dict to the Healer Agent's prompt, formatting each file as a labelled code block:
+
+```python
+context_str = ""
+for rel_name, content in context.items():
+    if rel_name != failing_file:
+        context_str += (
+            f"\n--- Context File: {rel_name} ---\n"
+            f"```python\n{content}\n```\n"
+        )
+```
+
+The Healer then sees both the broken file and the full source of every module it depends on, enabling accurate diagnosis of interface mismatches, wrong attribute accesses, and type errors that span module boundaries.
+
+<Warning>
+  Very large repositories with deeply interconnected modules can produce prompts that exceed the Gemini context window if `depth` is set too high. Always benchmark prompt sizes before increasing `depth` beyond 2.
+</Warning>
+
+---
+
+## Concrete Example
+
+Given this repository structure:
+
+```text
+my_repo/
+├── app/
+│   ├── models/
+│   │   └── schemas.py        # defines Order dataclass
+│   ├── services/
+│   │   ├── order_processor.py  # failing file — imports schemas
+│   │   └── validator.py        # also imports schemas
+│   └── core/
+│       └── config.py
+└── tests/
+    └── test_order_processor.py
+```
+
+Calling:
+
+```python
+analyzer = RepoAnalyzer()
+context = analyzer.extract_relevant_context(
+    repo_dir=Path("my_repo"),
+    failing_file="app/services/order_processor.py",
+    depth=1,
+)
+```
+
+Returns:
+
+```python
+{
+    "app/services/order_processor.py": "# ... full source ...",
+    "app/models/schemas.py": "# ... full source ...",
+    # validator.py is included because it also imports schemas
+    # (reverse-edge neighbor of schemas at depth 1)
+}
+```
+
+The `tests/` directory and `app/core/config.py` are excluded because they lie outside the depth-1 neighbourhood of `order_processor.py`.

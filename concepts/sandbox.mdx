@@ -1,0 +1,260 @@
+---
+title: "Python Execution Sandbox: Isolated Test Runner"
+sidebarTitle: "Sandbox"
+description: "How AutoFix runs pytest in a fully isolated subprocess, manages workspace files, and enforces timeouts — all through the PythonAdapter abstraction layer."
+---
+
+Every healing iteration runs generated tests in an isolated execution environment before any patch is accepted. The sandbox layer decouples test execution from the FastAPI process, preventing a broken test suite — or runaway code — from affecting the server. It is implemented as a two-layer design: a `BaseSandboxAdapter` abstract interface that defines the contract, and `PythonAdapter` as the concrete Python/pytest implementation.
+
+## BaseSandboxAdapter
+
+`BaseSandboxAdapter` is an abstract base class in `app/services/sandboxes/base.py`. It defines three abstract methods that every sandbox implementation must provide, plus one concrete utility method for subprocess execution.
+
+```python
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+
+class BaseSandboxAdapter(ABC):
+    """Abstract base class defining the interface for execution sandboxes."""
+
+    @abstractmethod
+    def write_files(self, workspace: Path, files: dict[str, str]) -> None:
+        """Write files to workspace directory safely."""
+        ...
+
+    @abstractmethod
+    def run_tests(self, workspace: Path, timeout: int = 30, **kwargs) -> tuple[bool, str]:
+        """Run tests within the workspace and return (passed, output)."""
+        ...
+
+    @abstractmethod
+    def clean(self, workspace: Path) -> None:
+        """Remove build artifacts, caches, and temp files from the workspace."""
+        ...
+
+    def _execute_command(
+        self,
+        cmd: list[str],
+        cwd: Path,
+        timeout: int = 30,
+        env: dict = None,
+    ) -> tuple[bool, str]:
+        """Execute a subprocess command with capture_output and timeout handling."""
+        ...
+```
+
+### `_execute_command()` — shared subprocess runner
+
+The concrete `_execute_command()` method is provided by the base class and used by `PythonAdapter.run_tests()`. It wraps `subprocess.run()` with:
+
+- `capture_output=True` — stdout and stderr both captured, never printed to the parent process
+- `text=True` — output decoded to `str` automatically
+- `timeout` — hard kill after `timeout` seconds; returns `(False, "Execution timed out after N seconds.")`
+- Combined output — `f"{result.stdout}\n{result.stderr}"` so callers see a single unified log string
+
+```python
+def _execute_command(
+    self,
+    cmd: list[str],
+    cwd: Path,
+    timeout: int = 30,
+    env: dict = None,
+) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        output = f"{result.stdout}\n{result.stderr}"
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, f"Execution timed out after {timeout} seconds."
+    except Exception as e:
+        return False, f"Sandbox execution error: {str(e)}"
+```
+
+---
+
+## PythonAdapter
+
+`PythonAdapter` in `app/services/sandboxes/adapters.py` is the production implementation used by every healing pipeline. It executes `pytest` via `sys.executable` so that the correct Python interpreter is always used regardless of the deployment environment.
+
+### `write_files()` — workspace population
+
+```python
+def write_files(self, workspace: Path, files: dict[str, str]) -> None:
+    """Write Python source and test files to workspace."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in files.items():
+        target_path = workspace / rel_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+```
+
+The `files` argument is a `dict[str, str]` mapping relative paths (e.g. `"target.py"`, `"test_target.py"`) to their string contents. The method creates intermediate directories as needed, so nested paths like `"tests/test_utils.py"` are handled without any additional setup.
+
+### `run_tests()` — synchronous pytest execution
+
+```python
+def run_tests(
+    self,
+    workspace: Path,
+    timeout: int = 30,
+    test_file: str | None = None,
+    extra_args: list[str] | None = None,
+    **kwargs,
+) -> tuple[bool, str]:
+    """Execute pytest suite within the workspace with PYTHONPATH set to the repository directory."""
+```
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `workspace` | `Path` | — | Absolute path to the directory containing source and test files |
+| `timeout` | `int` | `30` | Maximum seconds before the subprocess is killed |
+| `test_file` | `str \| None` | `None` | Specific test file path relative to `workspace`; auto-detected if omitted |
+| `extra_args` | `list[str] \| None` | `None` | Additional pytest CLI flags appended to the command |
+
+**Returns** — `tuple[bool, str]`: `(True, output)` if all tests passed (exit code 0), `(False, output)` otherwise.
+
+**How it builds the command:**
+
+```python
+cmd = [sys.executable, "-B", "-m", "pytest"]
+
+if target:
+    cmd.extend([str(target), "-v"])
+else:
+    cmd.append("-v")
+
+# Override restrictive testpaths (e.g. from pytest.ini) to discover test files in workspace
+cmd.extend(["-o", "testpaths=.", "-p", "no:cacheprovider"])
+
+if extra_args:
+    cmd.extend(extra_args)
+```
+
+The `-B` flag sets `PYTHONDONTWRITEBYTECODE` at the interpreter level. The `-o testpaths=.` override prevents a project-level `pytest.ini` or `pyproject.toml` from redirecting pytest away from the workspace directory. The `no:cacheprovider` plugin suppresses `.pytest_cache` writes during the run.
+
+**Environment configuration:**
+
+```python
+env = {
+    **os.environ,
+    "PYTHONPATH": str(repo_dir.resolve()),
+    "PYTHONDONTWRITEBYTECODE": "1",
+}
+```
+
+`PYTHONPATH` is set to the workspace root so that `from target import *` resolves correctly inside the generated test file.
+
+<Note>
+  The default `timeout` is **30 seconds**. Tests that exceed this budget are hard-killed and the sandbox returns `(False, "Execution timed out after 30 seconds.")`. Configure a longer timeout by passing `timeout=N` when calling `run_tests()` directly, or by adjusting the orchestrator call sites.
+</Note>
+
+### `create_subprocess_exec()` — async variant
+
+For contexts where the caller is already in an async event loop, `PythonAdapter` provides an async equivalent:
+
+```python
+async def create_subprocess_exec(
+    self,
+    repo_dir: Path,
+    test_file: str = "tests/test_event_formatter.py",
+    extra_args: list[str] | None = None,
+    timeout: int = 30,
+) -> tuple[bool, str]:
+    """Execute pytest asynchronously using asyncio.create_subprocess_exec with PYTHONPATH set."""
+```
+
+It uses `asyncio.create_subprocess_exec()` and `asyncio.wait_for()` for the timeout, then calls `proc.kill()` on `asyncio.TimeoutError` to avoid zombie processes:
+
+```python
+proc = await asyncio.create_subprocess_exec(
+    *cmd,
+    cwd=str(repo_path),
+    stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.PIPE,
+    env=env,
+)
+try:
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    output = (
+        stdout.decode("utf-8", errors="replace") + "\n" +
+        stderr.decode("utf-8", errors="replace")
+    ).strip()
+    return proc.returncode == 0, output
+except asyncio.TimeoutError:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    return False, f"Execution timed out after {timeout} seconds."
+```
+
+### `clean()` — artifact removal
+
+After each pipeline run, `clean()` recursively removes all Python bytecode artifacts from the workspace to prevent stale `.pyc` files from interfering with subsequent iterations:
+
+```python
+def clean(self, workspace: Path) -> None:
+    """Remove Python bytecode, __pycache__, and .pytest_cache artifacts."""
+    if not workspace.exists():
+        return
+    for item in list(workspace.rglob("*")):
+        try:
+            if item.is_dir() and item.name in {".pytest_cache", "__pycache__"}:
+                shutil.rmtree(item, ignore_errors=True)
+            elif item.is_file() and item.suffix in {".pyc", ".pyo"}:
+                item.unlink(missing_ok=True)
+        except Exception:
+            pass
+```
+
+Removed artifacts:
+
+| Artifact | Type | Removal method |
+|---|---|---|
+| `__pycache__/` | Directory | `shutil.rmtree()` |
+| `.pytest_cache/` | Directory | `shutil.rmtree()` |
+| `*.pyc` | File | `Path.unlink()` |
+| `*.pyo` | File | `Path.unlink()` |
+
+---
+
+## Security Properties
+
+<CardGroup cols={2}>
+  <Card title="Process Isolation" icon="shield">
+    Tests run in a child `subprocess`, not in the FastAPI process. A crash, `sys.exit()`, or infinite loop in generated code cannot bring down the API server.
+  </Card>
+  <Card title="Bytecode Suppression" icon="ban">
+    Both `-B` (interpreter flag) and `PYTHONDONTWRITEBYTECODE=1` (env var) ensure no `.pyc` files are written to disk during test execution.
+  </Card>
+  <Card title="Timeout Enforcement" icon="clock">
+    Both `subprocess.run(timeout=N)` and `asyncio.wait_for(timeout=N)` hard-kill the subprocess if it exceeds the limit, preventing runaway code from blocking a healing iteration.
+  </Card>
+  <Card title="Controlled Environment" icon="lock">
+    `PYTHONPATH` is set explicitly to the workspace root. No ambient environment paths are added; only the parent `os.environ` is inherited for standard system libraries.
+  </Card>
+</CardGroup>
+
+---
+
+## Factory Function
+
+A convenience factory is provided for obtaining a `PythonAdapter` instance:
+
+```python
+def get_sandbox(language: str = "python") -> PythonAdapter:
+    """Factory function returning the PythonAdapter sandbox implementation."""
+    return PythonAdapter()
+```
+
+Both `PythonSandbox` and `BaseSandbox` are backward-compatible aliases for `PythonAdapter` and `BaseSandboxAdapter` respectively, and can be used interchangeably.

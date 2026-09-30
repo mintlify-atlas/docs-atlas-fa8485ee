@@ -1,0 +1,262 @@
+---
+title: "How the AutoFix Self-Healing Pipeline Works"
+sidebarTitle: "How It Works"
+description: "Trace every stage of AutoFix's four-step healing loop: AI test generation, isolated sandbox execution, iterative Healer patching, and structured audit reporting."
+---
+
+AutoFix does not simply retry a failing function — it operates a structured, multi-agent feedback loop that mirrors what a senior engineer would do manually: write a test suite that pins the expected behavior, run the tests against the broken code, read the traceback carefully, fix the root cause, and confirm the fix by re-running the tests. All four steps are automated and orchestrated by `run_healing_pipeline()` in `app/services/orchestrator.py`.
+
+The pipeline emits a `LogEntry` at each significant state transition, giving you a precise audit trail of every decision the agents made. These entries are returned in the `logs` field of the `HealResponse` and can also be posted verbatim to a GitHub PR comment via the `audit_report` field.
+
+## The Four Pipeline Stages
+
+<Steps>
+
+### Stage 1 — Test Generation (Test Engineer Agent)
+
+The pipeline begins by handing the broken code and the plain-English functional requirements to the **Test Engineer Agent**. This agent uses the `PYTHON_TEST_ENGINEER_PROMPT` system persona — a "Senior QA Automation Engineer specializing in Python 3.12+ and pytest" — to synthesize a comprehensive `pytest` suite.
+
+The prompt sent to Gemini is constructed inline inside `run_healing_pipeline`. It embeds the functional requirements and the full target source code, then instructs the agent to return only valid Python test code. The raw LLM response is passed through `clean_code_fences()` to strip any surrounding markdown before being written to disk.
+
+```python
+raw_tests = await call_gemini(
+    prompt=test_prompt,           # contains requirements + target source
+    system_instruction=get_test_engineer_prompt(lang),
+    model=settings.PRIMARY_MODEL,
+)
+generated_tests = clean_code_fences(raw_tests)
+```
+
+The generated suite must comply with the Test Engineer persona's strict rules:
+
+- Import the target module using `from target import *`
+- Cover happy paths, boundary conditions, empty/`None` inputs, and expected exceptions
+- Use `@pytest.mark.parametrize` where applicable
+- Return only valid, executable Python — no prose or markdown commentary
+
+If the raw response contains markdown code fences (` ```python ... ``` `), `clean_code_fences()` strips them before the code is written to disk.
+
+A `TEST_GENERATION_SUCCESS` log entry is appended containing the full generated suite for inspection.
+
+### Stage 2 — Sandbox Preparation and Initial Test Run
+
+With a valid test suite in hand, the `PythonAdapter` (defined in `app/services/sandboxes/adapters.py`) takes over:
+
+1. **Clean** — removes any stale `.pytest_cache`, `__pycache__`, and `.pyc` artifacts from the previous run via `sandbox.clean(settings.WORKSPACE_DIR)`.
+2. **Write files** — writes both `target.py` (the source under test) and `test_target.py` (the generated suite) into `settings.WORKSPACE_DIR`.
+3. **Run tests** — executes `pytest` as a subprocess with `PYTHONPATH` pointing at the workspace directory, a 30-second timeout, and the `--no:cacheprovider` flag to avoid stale state.
+
+```python
+sandbox.clean(settings.WORKSPACE_DIR)
+sandbox.write_files(
+    settings.WORKSPACE_DIR,
+    {
+        source_file: request.buggy_code,
+        test_filename: generated_tests,
+    },
+)
+# ...
+passed, output = sandbox.run_tests(settings.WORKSPACE_DIR, timeout=30)
+```
+
+The subprocess command assembled by `PythonAdapter.run_tests` is:
+
+```bash
+python -B -m pytest test_target.py -v -o testpaths=. -p no:cacheprovider
+```
+
+If all tests pass on the very first run (i.e., the code was not actually broken), the pipeline short-circuits to `TESTS_PASSED` without calling the Healer agent at all.
+
+### Stage 3 — Self-Healing Loop (Healer Agent ↔ Sandbox)
+
+If any tests fail, the pipeline enters the iterative healing loop, bounded by `settings.MAX_HEALING_ITERATIONS` (default: `3`). Each iteration follows the same four-step pattern:
+
+1. **Diagnose** — The full test failure traceback is passed to the **Healer Agent** together with the current source code and the original requirements. The Healer uses the `PYTHON_HEALER_PROMPT` persona — a "Principal Python Systems Developer specializing in Python 3.12+ debugging and automated code remediation."
+
+2. **Patch** — The Healer returns a complete, corrected implementation of the target file. Partial snippets are explicitly forbidden by the persona constraints. `clean_code_fences()` strips any surrounding markdown, and the clean code is written back to the workspace.
+
+3. **Re-run** — `sandbox.run_tests()` executes `pytest` against the patched file.
+
+4. **Evaluate** — If `passed == True`, the loop breaks with `success = True`. Otherwise the new failure output becomes the input for the next iteration.
+
+```python
+while iteration < settings.MAX_HEALING_ITERATIONS:
+    passed, output = sandbox.run_tests(settings.WORKSPACE_DIR, timeout=30)
+
+    if passed:
+        success = True
+        break           # TESTS_PASSED log emitted, loop exits
+
+    iteration += 1
+    # healer_prompt embeds: requirements + current_code + pytest output
+    raw_patch = await call_gemini(
+        prompt=healer_prompt,
+        system_instruction=get_healer_prompt(lang),
+        model=settings.PRIMARY_MODEL,
+    )
+    patched_code = clean_code_fences(raw_patch)
+    current_code = patched_code
+    sandbox.write_files(settings.WORKSPACE_DIR, {"target.py": patched_code})
+```
+
+<Note>
+  `MAX_HEALING_ITERATIONS` defaults to `3` and is set in `app/core/config.py`. You can raise or lower it via the `MAX_HEALING_ITERATIONS` environment variable. Increasing it gives the Healer more chances on complex bugs but raises total Gemini API usage. When the cap is hit without a passing run, the pipeline terminates with `success: false` and returns the most recently patched version of the code.
+</Note>
+
+The pipeline logs one of the following `step_name` values for every significant event:
+
+| Step Name | When it fires |
+|---|---|
+| `PIPELINE_INIT` | Pipeline is constructed and validated |
+| `TEST_GENERATION` | Test Engineer agent begins synthesis |
+| `TEST_GENERATION_SUCCESS` | Generated suite is ready |
+| `SANDBOX_PREP` | Workspace cleaned and files written |
+| `SANDBOX_RUN` | `pytest` subprocess launched |
+| `TESTS_PASSED` | All tests green — loop exits |
+| `TESTS_FAILED` | One or more assertions failed |
+| `HEALER_START` | Healer agent begins diagnosis |
+| `CODE_PATCHED` | Patched code written to workspace |
+| `MAX_ITERATIONS_REACHED` | Cap hit without success |
+| `PIPELINE_COMPLETE` | Final cleanup done, response assembled |
+| `ERROR` | Any unhandled exception in a stage |
+
+### Stage 4 — Cleanup, Audit Report, and Response
+
+Once the loop exits, the pipeline:
+
+1. **Reads the final file** — reads the last version of `target.py` from disk (in case the Healer wrote it there) rather than relying on the in-memory `current_code` variable.
+2. **Cleans the sandbox** — removes all `.pytest_cache`, `__pycache__`, and `.pyc` artifacts.
+3. **Extracts test summary** — `extract_test_summary()` uses regex to parse both the initial failure output and the final run output into a per-test-case status table (e.g., `"FAILED"` → `"PASSED"`).
+4. **Builds the audit report** — `build_healing_audit_report()` (from `app/services/github_service.py`) renders a structured Markdown report containing the status, iteration count, AST dependency scope, test verification table, applied code patch, and initial failure logs.
+5. **Assembles `HealResponse`** — all collected data — `final_code`, `patches`, `logs`, `test_summary`, `audit_report`, and `failure_logs` — are packaged into a single validated `HealResponse` object.
+
+```python
+sandbox.clean(settings.WORKSPACE_DIR)
+
+patches = []
+if final_code != request.buggy_code:
+    patches.append(FilePatch(
+        file_path=source_file,
+        original_content=request.buggy_code,
+        patched_content=final_code,
+    ))
+
+audit_report = build_healing_audit_report(
+    iteration=iteration,
+    max_iterations=settings.MAX_HEALING_ITERATIONS,
+    failing_file=source_file,
+    model_name=settings.PRIMARY_MODEL,
+    ast_dependencies=[source_file, test_filename],
+    test_target=test_filename,
+    test_summary=test_summary,
+    patched_code=applied_patch,
+    language=lang,
+    failure_logs=initial_failure_logs,
+    status="Verified Passing ✅" if success else "Failed ❌",
+)
+
+return HealResponse(
+    success=success,
+    iterations_used=iteration,
+    final_code=final_code,
+    generated_tests=generated_tests,
+    patches=patches,
+    logs=logs,
+    audit_report=audit_report,
+    ...
+)
+```
+
+</Steps>
+
+## LLM Fallback Tiering
+
+Both the Test Engineer and Healer agents call Gemini through `call_gemini()` in `app/services/llm_client.py`. This function implements a multi-model tiering strategy so that transient API failures do not abort the entire healing run:
+
+```python
+PRIMARY_MODEL = getattr(settings, "GEMINI_MODEL", "gemini-3.6-flash")
+FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-flash-latest",
+]
+QUICK_BACKOFF_DELAYS = [1, 2]  # seconds between retries per model
+```
+
+The retry logic follows these rules:
+
+- **503 / UNAVAILABLE** — The current model is considered overloaded. The client logs a warning and immediately switches to the next candidate model without any backoff delay.
+- **429 / RESOURCE_EXHAUSTED** — Treated as a transient error. The client retries the same model up to `max_retries` times with 1-second and 2-second delays between attempts before moving on.
+- **Non-retryable errors (400, 401, 404)** — Logged immediately; the client skips to the next candidate model without any delay.
+- **All candidates exhausted** — A `RuntimeError` is raised, which the orchestrator catches and records as an `ERROR` log entry.
+
+## Repository Healing Pipeline
+
+When AutoFix is triggered via a GitHub App webhook, `run_repo_healing_pipeline()` is used instead. The key differences from the in-memory pipeline are:
+
+<Accordion title="Repository pipeline differences">
+
+1. **AST context extraction** — `RepoAnalyzer.extract_relevant_context()` builds a full import dependency graph for the repository using Python's built-in `ast` module. It performs a BFS traversal starting from the failing file up to `depth=1`, collecting both direct dependencies and reverse dependents.
+
+2. **Context-enriched prompts** — The Healer prompt includes the content of all related modules discovered by the AST analysis. This ensures the Healer understands any contracts or data structures the failing file imports from elsewhere in the codebase.
+
+3. **In-place patching** — The Healer writes the corrected code directly to the cloned repository on disk (`target_file_path.write_text(patched_code)`), rather than to an ephemeral workspace directory.
+
+4. **Existing test suite** — The pipeline runs the repository's own existing test files (e.g., `tests/test_<module>.py`) rather than generating a new suite from scratch.
+
+5. **Commit and push** — If the `GitHubService.commit_and_push_patch()` call succeeds, the fix is committed back to the PR branch using the GitHub App's installation access token.
+
+```python
+async def run_repo_healing_pipeline(
+    repo_dir: Path,
+    language: str = "python",
+    failing_file: str = "target.py",
+    failing_logs: str = "",
+) -> HealResponse:
+    ...
+    context = analyzer.extract_relevant_context(
+        repo_dir=repo_path,
+        failing_file=failing_file,
+        language=lang,
+        depth=1,
+    )
+    ...
+```
+
+</Accordion>
+
+## Pipeline Log Reference
+
+Every `LogEntry` in the `logs` array of the `HealResponse` carries a `step_name`, a `message`, and a UTC ISO-8601 `timestamp`. The full ordered sequence for a successful two-iteration heal looks like:
+
+```json
+[
+  {"step_name": "PIPELINE_INIT",          "message": "AutoFix multi-agent healing pipeline initialized..."},
+  {"step_name": "TEST_GENERATION",        "message": "Test Engineer Agent: Synthesizing pytest suite..."},
+  {"step_name": "TEST_GENERATION_SUCCESS","message": "Test suite successfully synthesized:\n```python\n..."},
+  {"step_name": "SANDBOX_PREP",           "message": "Cleaned sandbox and wrote target.py and test_target.py."},
+  {"step_name": "SANDBOX_RUN",            "message": "Running test suite in sandbox (Iteration #0)..."},
+  {"step_name": "TESTS_FAILED",           "message": "Test execution failed on iteration 1/3:\n..."},
+  {"step_name": "HEALER_START",           "message": "Healer Agent (Iteration 1/3): Analyzing failure logs..."},
+  {"step_name": "CODE_PATCHED",           "message": "Healer Agent (Iteration 1/3): Patched target.py written."},
+  {"step_name": "SANDBOX_RUN",            "message": "Running test suite in sandbox (Iteration #1)..."},
+  {"step_name": "TESTS_PASSED",           "message": "All test assertions passed successfully on iteration 1!"},
+  {"step_name": "PIPELINE_COMPLETE",      "message": "Pipeline finished. Success: True, Iterations: 1/3."}
+]
+```
+
+<Tip>
+  The `logs` array is ordered chronologically. Piping it through a simple filter on `step_name` lets you reconstruct exactly how many healing attempts were needed and what the Healer produced at each step.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the pipeline hands-on with a real broken function and see the healing loop in action.
+  </Card>
+  <Card title="GitHub Webhooks" icon="github" href="/integrations/github-webhooks">
+    Automate healing on every pull request by installing AutoFix as a GitHub App.
+  </Card>
+</CardGroup>

@@ -1,0 +1,235 @@
+---
+title: "LogEntry — Per-Step Healing Pipeline Trace Event Schema"
+sidebarTitle: "LogEntry"
+description: "Pydantic schema for a single timestamped trace event emitted by the AutoFix healing pipeline, capturing step name, message, and a UTC ISO 8601 timestamp."
+---
+
+Every meaningful transition inside the AutoFix orchestrator — from pipeline initialization through test generation, sandbox execution, Healer agent invocations, and final completion — emits a `LogEntry`. The ordered list of these entries is surfaced in `HealResponse.logs` and gives you a full, time-accurate audit trail of what happened during a healing run without needing to tail server logs.
+
+## Fields
+
+<ResponseField name="step_name" type="string" required>
+  Machine-readable identifier for the pipeline step that produced this entry. Used for filtering, alerting, and rendering in observability dashboards. See the [Step Name Reference](#step-name-reference) below for all known values.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable description of what occurred at this step. For `CODE_PATCHED` and `TEST_GENERATION_SUCCESS` steps the message includes the full code block wrapped in a markdown fence. For `TESTS_FAILED` steps it includes the raw pytest stdout/stderr.
+</ResponseField>
+
+<ResponseField name="timestamp" type="string">
+  Auto-generated UTC timestamp in ISO 8601 format (e.g. `"2025-01-15T10:00:03.501000+00:00"`). Set via `default_factory` at the moment the `LogEntry` is instantiated — no manual value is needed.
+
+  ```python
+  timestamp: str = Field(
+      default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+      description="ISO format timestamp of the log event",
+  )
+  ```
+</ResponseField>
+
+## Step Name Reference
+
+The tables below list every `step_name` value currently emitted by the orchestrator. They are split between the **single-file healing pipeline** (`run_healing_pipeline`) and the **repository healing pipeline** (`run_repo_healing_pipeline`).
+
+### Single-File Healing Pipeline
+
+<AccordionGroup>
+  <Accordion title="PIPELINE_INIT">
+    **Emitted:** Once, at the very start of `run_healing_pipeline`.
+
+    Signals that the multi-agent orchestrator has received the request and is about to call the Test Engineer agent.
+
+    ```
+    "AutoFix multi-agent healing pipeline initialized for Python project."
+    ```
+  </Accordion>
+
+  <Accordion title="TEST_GENERATION">
+    **Emitted:** Once, just before the Test Engineer agent LLM call.
+
+    Indicates that the system prompt and code/requirements payload are being sent to Gemini for test synthesis.
+
+    ```
+    "Test Engineer Agent: Synthesizing pytest suite based on requirements and code..."
+    ```
+  </Accordion>
+
+  <Accordion title="TEST_GENERATION_SUCCESS">
+    **Emitted:** Once, after the Test Engineer agent returns a non-empty test suite.
+
+    The `message` includes the full generated `pytest` source wrapped in a Python code fence.
+  </Accordion>
+
+  <Accordion title="SANDBOX_PREP">
+    **Emitted:** Once, after the sandbox workspace has been cleaned and both source files written.
+
+    ```
+    "Cleaned sandbox environment and wrote target.py and test_target.py."
+    ```
+  </Accordion>
+
+  <Accordion title="SANDBOX_RUN">
+    **Emitted:** At the start of every sandbox execution (iteration 0, 1, 2 …).
+
+    ```
+    "Running test suite in sandbox (Iteration #0)..."
+    ```
+  </Accordion>
+
+  <Accordion title="TESTS_PASSED">
+    **Emitted:** When `sandbox.run_tests()` returns `passed=True`.
+
+    Includes the full pytest stdout confirming which tests passed. The healing loop breaks immediately after this entry.
+  </Accordion>
+
+  <Accordion title="TESTS_FAILED">
+    **Emitted:** When `sandbox.run_tests()` returns `passed=False`.
+
+    The `message` contains the full pytest stdout/stderr with all failure tracebacks.
+  </Accordion>
+
+  <Accordion title="HEALER_START">
+    **Emitted:** At the start of each Healer agent LLM call, once per failed iteration.
+
+    ```
+    "Healer Agent (Iteration 1/3): Analyzing failure logs and generating code patch..."
+    ```
+  </Accordion>
+
+  <Accordion title="CODE_PATCHED">
+    **Emitted:** After the Healer agent returns a non-empty patch and the file has been written back to the sandbox.
+
+    The `message` includes the complete patched source code in a Python code fence.
+  </Accordion>
+
+  <Accordion title="MAX_ITERATIONS_REACHED">
+    **Emitted:** When `iteration >= MAX_HEALING_ITERATIONS` and tests are still failing.
+
+    ```
+    "Reached maximum healing iterations (3) without passing all tests."
+    ```
+  </Accordion>
+
+  <Accordion title="ERROR">
+    **Emitted:** On any unhandled exception during test generation, sandbox preparation, or a Healer agent call.
+
+    The `message` contains the exception type and message. The pipeline returns immediately after logging this entry.
+  </Accordion>
+
+  <Accordion title="PIPELINE_COMPLETE">
+    **Emitted:** At the very end of `run_healing_pipeline`, after sandbox cleanup, regardless of success or failure.
+
+    ```
+    "Pipeline finished. Success: true, Iterations: 1/3."
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Repository Healing Pipeline
+
+<AccordionGroup>
+  <Accordion title="REPO_PIPELINE_INIT">
+    **Emitted:** Once, at the start of `run_repo_healing_pipeline`.
+
+    Includes the repository name, language, and the failing file being targeted.
+
+    ```
+    "Repository healing pipeline initialized for my-repo (language: python, failing file: src/utils.py)."
+    ```
+  </Accordion>
+
+  <Accordion title="AST_CONTEXT_EXTRACTION">
+    **Emitted:** Before the `RepoAnalyzer.extract_relevant_context()` call.
+
+    ```
+    "Extracting AST dependency graph and relevant context for src/utils.py..."
+    ```
+  </Accordion>
+
+  <Accordion title="AST_CONTEXT_READY">
+    **Emitted:** After AST analysis completes successfully.
+
+    Includes the count and list of related files identified by the dependency graph.
+
+    ```
+    "Extracted context for 3 related file(s): ['src/utils.py', 'src/models.py', 'src/helpers.py']"
+    ```
+  </Accordion>
+
+  <Accordion title="REPO_HEALER_START">
+    **Emitted:** At the start of each Healer agent call during repository-level healing.
+
+    ```
+    "Healer Agent (Iteration 1/3): Analyzing repo context and repairing src/utils.py..."
+    ```
+  </Accordion>
+
+  <Accordion title="REPO_CODE_PATCHED">
+    **Emitted:** After the Healer agent patch has been written directly to the repository file on disk.
+
+    The `message` includes the complete patched source in a Python code fence.
+  </Accordion>
+
+  <Accordion title="REPO_TEST_RUN">
+    **Emitted:** Before each sandbox test execution within the repository pipeline.
+
+    ```
+    "Running repository tests (Iteration 1)..."
+    ```
+  </Accordion>
+
+  <Accordion title="REPO_PIPELINE_COMPLETE">
+    **Emitted:** At the very end of `run_repo_healing_pipeline`, after sandbox cleanup.
+
+    ```
+    "Repository healing pipeline completed. Success: true, Iterations: 2/3."
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  The `ERROR` step name is shared between both pipelines and can appear at any point where an unhandled exception is caught. Always check for `ERROR` entries before assuming `success: false` means the pipeline ran all iterations.
+</Note>
+
+## Example LogEntry
+
+```json
+{
+  "step_name": "HEALER_START",
+  "message": "Healer Agent (Iteration 1/3): Analyzing failure logs and generating code patch...",
+  "timestamp": "2025-01-15T10:00:03.620000+00:00"
+}
+```
+
+## Filtering Logs Programmatically
+
+Because `step_name` is a plain string you can filter and group entries from the `logs` list in `HealResponse` with a straightforward list comprehension:
+
+```python
+from app.models.schemas import HealResponse
+
+response: HealResponse = ...
+
+# Get all failure entries
+failures = [e for e in response.logs if e.step_name == "TESTS_FAILED"]
+
+# Get all entries in chronological order (they already are, but re-sorting is safe)
+import datetime
+sorted_logs = sorted(response.logs, key=lambda e: e.timestamp)
+
+# Extract just the ERROR entries for alerting
+errors = [e for e in response.logs if e.step_name == "ERROR"]
+if errors:
+    print("Pipeline encountered errors:", [e.message for e in errors])
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="HealResponse Schema" icon="file-export" href="/api-reference/schemas/heal-response">
+    The parent schema that contains the full ordered list of LogEntry objects.
+  </Card>
+  <Card title="FilePatch Schema" icon="file-pen" href="/api-reference/schemas/file-patch">
+    The schema for patch records that accompany CODE_PATCHED log events.
+  </Card>
+</CardGroup>

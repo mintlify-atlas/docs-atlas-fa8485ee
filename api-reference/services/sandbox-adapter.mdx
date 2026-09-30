@@ -1,0 +1,375 @@
+---
+title: "Sandbox Adapters: Isolated Python Test Execution Layer"
+sidebarTitle: "Sandbox Adapter"
+description: "Sandbox abstraction: BaseSandboxAdapter interface and PythonAdapter that write files, run pytest in a subprocess, and clean build artifacts each iteration."
+---
+
+The sandbox adapter layer provides a clean abstraction between the healing pipeline and the process of actually running tests. `BaseSandboxAdapter` defines the contract; `PythonAdapter` implements it for Python projects using `pytest` in an isolated subprocess. A factory function `get_sandbox()` constructs the right adapter for a given language.
+
+## Class: `BaseSandboxAdapter`
+
+Abstract base class that every sandbox adapter must implement. Located in `app/services/sandboxes/base.py`.
+
+```python
+from app.services.sandboxes.base import BaseSandboxAdapter
+```
+
+<Note>
+  A backward-compatibility alias `BaseSandbox = BaseSandboxAdapter` is exported from the same module. New code should use `BaseSandboxAdapter`.
+</Note>
+
+### Abstract Methods
+
+#### `write_files()`
+
+Write one or more files into the workspace directory before running tests.
+
+```python
+@abstractmethod
+def write_files(self, workspace: Path, files: dict[str, str]) -> None
+```
+
+<ParamField path="workspace" type="Path" required>
+  Root directory of the sandbox workspace.
+</ParamField>
+
+<ParamField path="files" type="dict[str, str]" required>
+  Mapping of relative file paths to their UTF-8 string contents, e.g. `{"target.py": "def add(a, b): ...", "test_target.py": "import pytest..."}`.
+</ParamField>
+
+---
+
+#### `run_tests()`
+
+Execute the test suite inside the workspace and return a pass/fail signal along with the combined stdout+stderr output.
+
+```python
+@abstractmethod
+def run_tests(self, workspace: Path, timeout: int = 30, **kwargs) -> tuple[bool, str]
+```
+
+<ParamField path="workspace" type="Path" required>
+  Path to the workspace root where test files reside.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="30">
+  Maximum seconds to allow the test process to run before it is killed and a timeout error is returned.
+</ParamField>
+
+**Returns:** `tuple[bool, str]` — `(passed, output)` where `passed` is `True` when the test runner exits with code `0`.
+
+---
+
+#### `clean()`
+
+Remove build artefacts, caches, and temporary files from the workspace to ensure a clean state for the next iteration.
+
+```python
+@abstractmethod
+def clean(self, workspace: Path) -> None
+```
+
+---
+
+### Concrete Method: `_execute_command()`
+
+Provided by `BaseSandboxAdapter` (not abstract). Runs a subprocess and returns the combined output. All concrete adapters call this internally rather than invoking `subprocess.run` directly.
+
+```python
+def _execute_command(
+    self,
+    cmd: list[str],
+    cwd: Path,
+    timeout: int = 30,
+    env: dict = None,
+) -> tuple[bool, str]
+```
+
+<ParamField path="cmd" type="list[str]" required>
+  Command and arguments list, e.g. `[sys.executable, "-m", "pytest", "test_target.py", "-v"]`.
+</ParamField>
+
+<ParamField path="cwd" type="Path" required>
+  Working directory passed to `subprocess.run`. Usually the same as `workspace`.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="30">
+  Seconds before `subprocess.TimeoutExpired` is caught and `(False, "Execution timed out after N seconds.")` is returned.
+</ParamField>
+
+<ParamField path="env" type="dict | None" default="None">
+  Environment variables dict. When `None`, the subprocess inherits the parent process environment.
+</ParamField>
+
+**Returns:** `tuple[bool, str]`
+
+- `(True, stdout + "\n" + stderr)` when `returncode == 0`
+- `(False, stdout + "\n" + stderr)` on non-zero exit
+- `(False, "Execution timed out after N seconds.")` on timeout
+- `(False, "Sandbox execution error: {str(e)}")` on any other exception
+
+---
+
+## Class: `PythonAdapter`
+
+Concrete implementation of `BaseSandboxAdapter` for Python projects. Runs `pytest` in a subprocess with `PYTHONPATH` set to the workspace root so the test files can import source modules without an installed package. Located in `app/services/sandboxes/adapters.py`.
+
+```python
+from app.services.sandboxes import PythonAdapter
+
+sandbox = PythonAdapter()
+```
+
+<Note>
+  The alias `PythonSandbox = PythonAdapter` is exported for backward compatibility with code written before the adapter refactor.
+</Note>
+
+### `write_files()`
+
+Creates parent directories as needed and writes each file as UTF-8.
+
+```python
+def write_files(self, workspace: Path, files: dict[str, str]) -> None
+```
+
+<ParamField path="workspace" type="Path" required>
+  The workspace root. Created (including parents) if it does not already exist via `workspace.mkdir(parents=True, exist_ok=True)`.
+</ParamField>
+
+<ParamField path="files" type="dict[str, str]" required>
+  Relative path → file content mapping. Intermediate directories in each relative path are also created automatically.
+</ParamField>
+
+```python
+from pathlib import Path
+from app.services.sandboxes import PythonAdapter
+
+sandbox = PythonAdapter()
+workspace = Path("/tmp/autofix-workspace")
+
+sandbox.write_files(workspace, {
+    "target.py": "def add(a, b):\n    return a + b\n",
+    "test_target.py": "from target import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+})
+```
+
+---
+
+### `run_tests()`
+
+Executes `pytest` against the workspace using the same Python interpreter that is running AutoFix. Injects `PYTHONPATH=<workspace>` so source files are importable without installation and sets `PYTHONDONTWRITEBYTECODE=1` to prevent `.pyc` generation.
+
+```python
+def run_tests(
+    self,
+    workspace: Path,
+    timeout: int = 30,
+    test_file: str | None = None,
+    extra_args: list[str] | None = None,
+    **kwargs,
+) -> tuple[bool, str]
+```
+
+<ParamField path="workspace" type="Path" required>
+  Root directory that is also set as `PYTHONPATH` and the subprocess `cwd`.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="30">
+  Maximum seconds before the pytest process is killed.
+</ParamField>
+
+<ParamField path="test_file" type="str | None" default="None">
+  Repo-relative path to the specific test file to run (e.g. `"tests/test_parser.py"`). When `None`, pytest discovers all tests under the workspace using `-o testpaths=.`.
+</ParamField>
+
+<ParamField path="extra_args" type="list[str] | None" default="None">
+  Additional arguments appended to the pytest command, e.g. `["-k", "test_divide"]`.
+</ParamField>
+
+**Returns:** `tuple[bool, str]` — `(passed, combined_output)`
+
+The pytest command is assembled as:
+
+```python
+[sys.executable, "-B", "-m", "pytest"]
+# + [test_file, "-v"]  if test_file is provided
+# + ["-v"]             otherwise
+# + ["-o", "testpaths=.", "-p", "no:cacheprovider"]
+# + extra_args         if provided
+```
+
+The `-o testpaths=.` flag overrides any restrictive `testpaths` in the repo's `pytest.ini` or `pyproject.toml` so the adapter always discovers tests in the workspace root. `-p no:cacheprovider` disables the pytest cache to prevent stale state between iterations.
+
+```python
+passed, output = sandbox.run_tests(
+    workspace=Path("/tmp/autofix-workspace"),
+    timeout=30,
+    test_file="test_target.py",
+)
+
+if passed:
+    print("All tests passed!")
+else:
+    print("Failures:\n", output)
+```
+
+---
+
+### `create_subprocess_exec()`
+
+Async variant of `run_tests()` that uses `asyncio.create_subprocess_exec` instead of `subprocess.run`. Useful when the caller is already in an async context and wants to avoid blocking the event loop even for the duration of the `asyncio.to_thread` call used in the sync version.
+
+```python
+async def create_subprocess_exec(
+    self,
+    repo_dir: Path,
+    test_file: str = "tests/test_event_formatter.py",
+    extra_args: list[str] | None = None,
+    timeout: int = 30,
+) -> tuple[bool, str]
+```
+
+<ParamField path="repo_dir" type="Path" required>
+  Repository directory used as both `cwd` and `PYTHONPATH`.
+</ParamField>
+
+<ParamField path="test_file" type="str" default="tests/test_event_formatter.py">
+  Test file path relative to `repo_dir`.
+</ParamField>
+
+<ParamField path="extra_args" type="list[str] | None" default="None">
+  Additional pytest arguments.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="30">
+  Seconds before `asyncio.wait_for` times out. On timeout the subprocess is killed and `(False, "Execution timed out after N seconds.")` is returned.
+</ParamField>
+
+**Returns:** `tuple[bool, str]`
+
+```python
+import asyncio
+from pathlib import Path
+from app.services.sandboxes import PythonAdapter
+
+sandbox = PythonAdapter()
+
+passed, output = asyncio.run(
+    sandbox.create_subprocess_exec(
+        repo_dir=Path("/tmp/autofix-repos/my-org/my-repo"),
+        test_file="tests/test_parser.py",
+        timeout=60,
+    )
+)
+```
+
+---
+
+### `clean()`
+
+Walks the workspace recursively and removes Python bytecode and cache directories. Handles deletion errors silently so a failed removal never interrupts the healing loop.
+
+```python
+def clean(self, workspace: Path) -> None
+```
+
+<ParamField path="workspace" type="Path" required>
+  Root directory to clean. No-ops if the path does not exist.
+</ParamField>
+
+Removes:
+
+| Artefact | Removal method |
+|---|---|
+| `__pycache__/` directories | `shutil.rmtree(item, ignore_errors=True)` |
+| `.pytest_cache/` directories | `shutil.rmtree(item, ignore_errors=True)` |
+| `*.pyc` files | `item.unlink(missing_ok=True)` |
+| `*.pyo` files | `item.unlink(missing_ok=True)` |
+
+```python
+sandbox.clean(Path("/tmp/autofix-workspace"))
+# Removes all __pycache__, .pytest_cache, .pyc, and .pyo artefacts
+```
+
+---
+
+## Factory Function: `get_sandbox()`
+
+Returns a `PythonAdapter` instance. Exists as an extensibility point — future language adapters can be returned here based on the `language` argument without changing call sites.
+
+```python
+def get_sandbox(language: str = "python") -> PythonAdapter
+```
+
+<ParamField path="language" type="str" default="python">
+  Target language. Currently always returns a `PythonAdapter` regardless of value.
+</ParamField>
+
+**Returns:** `PythonAdapter`
+
+```python
+from app.services.sandboxes.adapters import get_sandbox
+
+sandbox = get_sandbox("python")
+# PythonAdapter()
+```
+
+---
+
+## Complete Usage Example
+
+The following shows the full write → run → inspect → clean cycle used inside `run_healing_pipeline()`:
+
+```python
+import asyncio
+from pathlib import Path
+from app.services.sandboxes.adapters import get_sandbox
+
+workspace = Path("/tmp/autofix-workspace")
+sandbox = get_sandbox("python")
+
+source_code = """
+def divide(a, b):
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    return a / b
+"""
+
+test_code = """
+import pytest
+from target import divide
+
+def test_normal_division():
+    assert divide(10, 2) == 5.0
+
+def test_zero_division():
+    with pytest.raises(ValueError):
+        divide(1, 0)
+"""
+
+# 1. Clean stale state from any previous iteration
+sandbox.clean(workspace)
+
+# 2. Write source + test files
+sandbox.write_files(workspace, {
+    "target.py": source_code,
+    "test_target.py": test_code,
+})
+
+# 3. Execute pytest
+passed, output = sandbox.run_tests(
+    workspace=workspace,
+    timeout=30,
+    test_file="test_target.py",
+)
+
+print(f"Tests passed: {passed}")
+print(output)
+
+# 4. Clean up artefacts
+sandbox.clean(workspace)
+```
+
+<Tip>
+  The `WORKSPACE_DIR` used by `run_healing_pipeline()` is configured via `settings.WORKSPACE_DIR` (default `./workspace` relative to the project root, resolved to an absolute path at startup). Each pipeline run calls `sandbox.clean()` at the start and end of every job, so parallel runs should use distinct workspace directories.
+</Tip>

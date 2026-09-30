@@ -1,0 +1,242 @@
+---
+title: "HealResponse — Healing Pipeline Full Output Schema"
+sidebarTitle: "HealResponse"
+description: "AutoFix healing pipeline output: healed code, file patches, structured logs, per-test before/after results, and a pre-rendered Markdown audit report."
+---
+
+`HealResponse` is the complete record of everything that happened during a healing run. It is returned synchronously from the `/heal` endpoint once the self-healing loop exits — either because all tests passed, all iterations were exhausted, or a fatal error occurred. Beyond the final code, the response includes the full ordered log trail, per-test status mappings, a list of file patches, and a pre-rendered Markdown audit report ready to post as a GitHub PR comment.
+
+## Core Outcome Fields
+
+<ResponseField name="success" type="boolean" required>
+  `true` if all generated `pytest` assertions passed in the final sandbox run; `false` if the pipeline exhausted its maximum iterations or encountered a fatal error without achieving a clean test run.
+</ResponseField>
+
+<ResponseField name="iterations_used" type="integer" required>
+  Number of Healer Agent iterations that were actually executed. Will be `0` if the very first sandbox run already passed (no healing needed), up to `MAX_HEALING_ITERATIONS`.
+</ResponseField>
+
+<ResponseField name="final_code" type="string" required>
+  The complete source code of the target file as it existed at the end of the pipeline — either the original code if no patch improved it, or the last patch the Healer agent applied.
+</ResponseField>
+
+<ResponseField name="generated_tests" type="string" required>
+  The full `pytest` test suite synthesized by the Test Engineer agent. This is the verbatim Python source that was written to the sandbox and executed during every iteration.
+</ResponseField>
+
+## Language and Targeting
+
+<ResponseField name="language" type="string" default="python">
+  Target programming language — mirrors the value from `HealRequest`.
+</ResponseField>
+
+<ResponseField name="failing_file" type="string">
+  Relative path to the source file that was targeted for healing (e.g. `compound_interest.py`). Matches the `file_path` from the request, defaulting to `target.py`.
+</ResponseField>
+
+<ResponseField name="test_target" type="string">
+  Relative path to the generated test file that was executed in the sandbox (e.g. `test_target.py` or `tests/test_compound_interest.py`).
+</ResponseField>
+
+<ResponseField name="ast_dependencies" type="array of strings">
+  List of source file paths that the AST analyzer identified as interdependent with the failing file. For single-file healing this is always `[source_file, test_filename]`. For repository-level healing it reflects the full dependency graph.
+</ResponseField>
+
+## Patches and Aliases
+
+<ResponseField name="patches" type="array of FilePatch" default="[]">
+  List of `FilePatch` objects representing each file that was changed during the healing run. A patch is only appended when `final_code != original buggy_code`. See [FilePatch schema](/api-reference/schemas/file-patch) for field details.
+</ResponseField>
+
+<ResponseField name="patched_code" type="string">
+  Convenience alias: the `patched_content` from the first entry in `patches`, or an empty string if no patch was applied. Auto-populated by `model_post_init` when `patches` is non-empty.
+</ResponseField>
+
+<ResponseField name="iterations" type="integer" default="0">
+  Alias for `iterations_used`. Both fields are kept in sync by `model_post_init`; prefer `iterations_used` in new integrations.
+</ResponseField>
+
+<ResponseField name="model_name" type="string">
+  Name of the Gemini model used for both the Test Engineer and Healer agents (e.g. `"gemini-3.6-flash"`). Mirrors `settings.PRIMARY_MODEL`.
+</ResponseField>
+
+<ResponseField name="model_used" type="string">
+  Alias for `model_name`. Both fields are kept in sync by `model_post_init`.
+</ResponseField>
+
+<ResponseField name="max_iterations" type="integer" default="3">
+  The `MAX_HEALING_ITERATIONS` ceiling that was configured when the pipeline ran.
+</ResponseField>
+
+## Logs and Diagnostics
+
+<ResponseField name="logs" type="array of LogEntry" default="[]">
+  Chronological list of `LogEntry` objects emitted at every pipeline step. Useful for debugging, observability dashboards, and building audit trails. See [LogEntry schema](/api-reference/schemas/log-entry) for field details.
+</ResponseField>
+
+<ResponseField name="failure_logs" type="string">
+  The raw `pytest` stdout/stderr captured during the **first** failing sandbox run. This is the original traceback before any Healer agent intervention.
+</ResponseField>
+
+<ResponseField name="audit_report" type="string">
+  A pre-rendered Markdown string containing the full healing audit report — iteration count, model, AST dependencies, per-test before/after status table, and the final patched code. Identical to the content posted as a GitHub PR comment by the GitHub App integration.
+</ResponseField>
+
+<ResponseField name="test_summary" type="object" default="{}">
+  A dictionary mapping each `pytest` test case identifier to its initial and final status. Keys are test node IDs (e.g. `"test_target.py::test_zero_rate"`). Each value is an object with two keys:
+
+  <Expandable title="test_summary value shape">
+    <ResponseField name="initial" type="string">
+      Status of the test during the first sandbox run. Either `"Passed ✅"` or `"Failed ❌"`.
+    </ResponseField>
+    <ResponseField name="final" type="string">
+      Status of the test after the last sandbox run. Either `"Passed ✅"` or `"Failed ❌"`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example Response
+
+The JSON below shows a successful healing run that fixed the compound-interest bug in one iteration.
+
+```json
+{
+  "success": true,
+  "iterations_used": 1,
+  "iterations": 1,
+  "final_code": "def compound_interest(principal, rate, periods):\n    \"\"\"\n    Return the total accumulated amount after applying compound interest.\n    Formula: A = P * (1 + r) ** n\n    \"\"\"\n    if principal < 0:\n        raise ValueError(\"principal must be non-negative\")\n    if periods < 0:\n        raise ValueError(\"periods must be non-negative\")\n    amount = principal * (1 + rate) ** periods\n    return round(amount, 2)\n",
+  "patched_code": "def compound_interest(principal, rate, periods):\n    \"\"\"\n    Return the total accumulated amount after applying compound interest.\n    Formula: A = P * (1 + r) ** n\n    \"\"\"\n    if principal < 0:\n        raise ValueError(\"principal must be non-negative\")\n    if periods < 0:\n        raise ValueError(\"periods must be non-negative\")\n    amount = principal * (1 + rate) ** periods\n    return round(amount, 2)\n",
+  "generated_tests": "import pytest\nfrom compound_interest import compound_interest\n\ndef test_basic_compound():\n    assert compound_interest(1000, 0.05, 3) == 1157.63\n\ndef test_zero_rate():\n    assert compound_interest(500, 0, 10) == 500.0\n\ndef test_zero_periods():\n    assert compound_interest(800, 0.1, 0) == 800.0\n\ndef test_negative_principal_raises():\n    with pytest.raises(ValueError):\n        compound_interest(-100, 0.05, 5)\n\ndef test_negative_periods_raises():\n    with pytest.raises(ValueError):\n        compound_interest(1000, 0.05, -1)\n",
+  "language": "python",
+  "failing_file": "compound_interest.py",
+  "test_target": "test_target.py",
+  "model_name": "gemini-3.6-flash",
+  "model_used": "gemini-3.6-flash",
+  "max_iterations": 3,
+  "ast_dependencies": [
+    "compound_interest.py",
+    "test_target.py"
+  ],
+  "patches": [
+    {
+      "file_path": "compound_interest.py",
+      "original_content": "def compound_interest(principal, rate, periods):\n    amount = principal * rate ** periods\n    return round(amount, 2)\n",
+      "patched_content": "def compound_interest(principal, rate, periods):\n    if principal < 0:\n        raise ValueError(\"principal must be non-negative\")\n    if periods < 0:\n        raise ValueError(\"periods must be non-negative\")\n    amount = principal * (1 + rate) ** periods\n    return round(amount, 2)\n"
+    }
+  ],
+  "logs": [
+    {
+      "step_name": "PIPELINE_INIT",
+      "message": "AutoFix multi-agent healing pipeline initialized for Python project.",
+      "timestamp": "2025-01-15T10:00:00.000000+00:00"
+    },
+    {
+      "step_name": "TEST_GENERATION",
+      "message": "Test Engineer Agent: Synthesizing pytest suite based on requirements and code...",
+      "timestamp": "2025-01-15T10:00:00.421000+00:00"
+    },
+    {
+      "step_name": "TEST_GENERATION_SUCCESS",
+      "message": "Test suite successfully synthesized.",
+      "timestamp": "2025-01-15T10:00:02.108000+00:00"
+    },
+    {
+      "step_name": "SANDBOX_PREP",
+      "message": "Cleaned sandbox environment and wrote compound_interest.py and test_target.py.",
+      "timestamp": "2025-01-15T10:00:02.215000+00:00"
+    },
+    {
+      "step_name": "SANDBOX_RUN",
+      "message": "Running test suite in sandbox (Iteration #0)...",
+      "timestamp": "2025-01-15T10:00:02.340000+00:00"
+    },
+    {
+      "step_name": "TESTS_FAILED",
+      "message": "Test execution failed on iteration 1/3.",
+      "timestamp": "2025-01-15T10:00:03.501000+00:00"
+    },
+    {
+      "step_name": "HEALER_START",
+      "message": "Healer Agent (Iteration 1/3): Analyzing failure logs and generating code patch...",
+      "timestamp": "2025-01-15T10:00:03.620000+00:00"
+    },
+    {
+      "step_name": "CODE_PATCHED",
+      "message": "Healer Agent (Iteration 1/3): Patched compound_interest.py written to sandbox.",
+      "timestamp": "2025-01-15T10:00:05.980000+00:00"
+    },
+    {
+      "step_name": "TESTS_PASSED",
+      "message": "All test assertions passed successfully on iteration 1!",
+      "timestamp": "2025-01-15T10:00:06.870000+00:00"
+    },
+    {
+      "step_name": "PIPELINE_COMPLETE",
+      "message": "Pipeline finished. Success: true, Iterations: 1/3.",
+      "timestamp": "2025-01-15T10:00:06.905000+00:00"
+    }
+  ],
+  "failure_logs": "FAILED test_target.py::test_basic_compound - AssertionError: assert 125.0 == 1157.63\nFAILED test_target.py::test_zero_rate - AssertionError: assert 0.0 == 500.0",
+  "audit_report": "## 🤖 AutoFix Healing Audit Report\n\n**Status:** Verified Passing ✅  \n**Iterations:** 1 / 3  ...",
+  "test_summary": {
+    "test_target.py::test_basic_compound": {
+      "initial": "Failed ❌",
+      "final": "Passed ✅"
+    },
+    "test_target.py::test_zero_rate": {
+      "initial": "Failed ❌",
+      "final": "Passed ✅"
+    },
+    "test_target.py::test_zero_periods": {
+      "initial": "Failed ❌",
+      "final": "Passed ✅"
+    },
+    "test_target.py::test_negative_principal_raises": {
+      "initial": "Failed ❌",
+      "final": "Passed ✅"
+    },
+    "test_target.py::test_negative_periods_raises": {
+      "initial": "Failed ❌",
+      "final": "Passed ✅"
+    }
+  }
+}
+```
+
+<Tip>
+  Check `success` first, then inspect `test_summary` to see which specific test cases flipped from `"Failed ❌"` to `"Passed ✅"`. The `failure_logs` field gives you the raw pytest traceback from the very first run so you can correlate the root cause with the final patch.
+</Tip>
+
+## Alias Synchronization
+
+`HealResponse` exposes several aliased fields for backwards compatibility. The `model_post_init` hook keeps them in sync automatically:
+
+```python
+def model_post_init(self, __context) -> None:
+    if self.iterations == 0 and self.iterations_used > 0:
+        self.iterations = self.iterations_used
+    if not self.model_used and self.model_name:
+        self.model_used = self.model_name
+    if not self.model_name and self.model_used:
+        self.model_name = self.model_used
+    if not self.patched_code and self.patches:
+        self.patched_code = self.patches[0].patched_content
+```
+
+<Warning>
+  Do not rely on only one alias in your integration code. If you are building on top of the AutoFix API, prefer the **canonical** field names: `iterations_used`, `model_name`, and `patches[0].patched_content`.
+</Warning>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="HealRequest Schema" icon="file-import" href="/api-reference/schemas/heal-request">
+    The input payload that configures a healing run.
+  </Card>
+  <Card title="FilePatch Schema" icon="file-pen" href="/api-reference/schemas/file-patch">
+    Structure of each file patch record inside the patches array.
+  </Card>
+  <Card title="LogEntry Schema" icon="list-timeline" href="/api-reference/schemas/log-entry">
+    Structured trace events that populate the logs array.
+  </Card>
+</CardGroup>
