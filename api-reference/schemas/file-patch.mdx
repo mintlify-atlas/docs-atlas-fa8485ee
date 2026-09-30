@@ -8,10 +8,12 @@ When the AutoFix Healer agent successfully repairs a source file, it produces a 
 
 ## When Is a Patch Created?
 
-A `FilePatch` is only appended when the pipeline determines that the final code actually changed from what was submitted. The orchestrator performs an explicit string comparison before constructing the record:
+A `FilePatch` is only appended when the pipeline determines that the final code actually changed from what was submitted. The orchestrator performs an explicit string comparison before constructing the record.
+
+**Single-file healing pipeline** (`run_healing_pipeline`):
 
 ```python
-# From app/services/orchestrator.py
+# From app/services/orchestrator.py — run_healing_pipeline
 patches: list[FilePatch] = []
 if final_code != request.buggy_code:
     patches.append(
@@ -23,7 +25,22 @@ if final_code != request.buggy_code:
     )
 ```
 
-If the Healer agent's output is byte-for-byte identical to the original input (rare but possible if the bug was in the test rather than the source), `patches` will be an empty list even when `success` is `true`.
+**Repository healing pipeline** (`run_repo_healing_pipeline`):
+
+```python
+# From app/services/orchestrator.py — run_repo_healing_pipeline
+patches: list[FilePatch] = []
+if final_code != original_code:
+    patches.append(
+        FilePatch(
+            file_path=failing_file,
+            original_content=original_code,
+            patched_content=final_code,
+        )
+    )
+```
+
+In the repository pipeline `original_code` is the file content read from disk before any Healer agent call, rather than a request field. In both cases, if the Healer agent's output is byte-for-byte identical to the original content (rare but possible if the bug was in the test rather than the source), `patches` will be an empty list even when `success` is `true`.
 
 ## Fields
 

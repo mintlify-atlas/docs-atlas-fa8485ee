@@ -1,7 +1,7 @@
 ---
-title: "How the AutoFix Self-Healing Pipeline Works"
+title: "How AutoFix Works: The Multi-Agent Self-Healing Pipeline"
 sidebarTitle: "How It Works"
-description: "Trace every stage of AutoFix's four-step healing loop: AI test generation, isolated sandbox execution, iterative Healer patching, and structured audit reporting."
+description: "Trace every stage of AutoFix's healing loop: AI test generation, isolated sandbox execution, iterative Healer patching, and structured audit reporting."
 ---
 
 AutoFix does not simply retry a failing function — it operates a structured, multi-agent feedback loop that mirrors what a senior engineer would do manually: write a test suite that pins the expected behavior, run the tests against the broken code, read the traceback carefully, fix the root cause, and confirm the fix by re-running the tests. All four steps are automated and orchestrated by `run_healing_pipeline()` in `app/services/orchestrator.py`.
@@ -234,7 +234,7 @@ Every `LogEntry` in the `logs` array of the `HealResponse` carries a `step_name`
 [
   {"step_name": "PIPELINE_INIT",          "message": "AutoFix multi-agent healing pipeline initialized..."},
   {"step_name": "TEST_GENERATION",        "message": "Test Engineer Agent: Synthesizing pytest suite..."},
-  {"step_name": "TEST_GENERATION_SUCCESS","message": "Test suite successfully synthesized:\n```python\n..."},
+  {"step_name": "TEST_GENERATION_SUCCESS","message": "Test suite successfully synthesized (pytest code follows)."},
   {"step_name": "SANDBOX_PREP",           "message": "Cleaned sandbox and wrote target.py and test_target.py."},
   {"step_name": "SANDBOX_RUN",            "message": "Running test suite in sandbox (Iteration #0)..."},
   {"step_name": "TESTS_FAILED",           "message": "Test execution failed on iteration 1/3:\n..."},

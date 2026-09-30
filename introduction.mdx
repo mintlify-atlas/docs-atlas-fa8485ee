@@ -1,7 +1,7 @@
 ---
 title: "AutoFix: Autonomous Multi-Agent Python Code Healer"
 sidebarTitle: "Introduction"
-description: "Learn how AutoFix bridges QA and development by combining AI agents, an isolated sandbox, and iterative self-healing to automatically fix broken Python code."
+description: "Learn how AutoFix bridges QA and development using AI agents, an isolated sandbox, and iterative self-healing to automatically fix broken Python code."
 ---
 
 AutoFix is a FastAPI-powered engine that closes the gap between quality assurance and software engineering. Instead of merely *finding* bugs, AutoFix autonomously *resolves* them: it receives broken Python code alongside a plain-English specification, spins up two specialized AI agents, runs the code inside an isolated subprocess sandbox, and iterates until every generated test passes — or until the configured maximum healing iteration cap is reached.
@@ -77,6 +77,6 @@ AutoFix ships with two pipeline entrypoints, both defined in `app/services/orche
     icon="layer-group"
     href="/how-it-works"
   >
-    `call_gemini()` automatically cycles through a prioritized list of Gemini model candidates — retrying transient `429` errors with exponential backoff and immediately failing over on `503` overload responses.
+    `call_gemini()` automatically cycles through a prioritized list of Gemini model candidates — retrying transient `429` errors with fixed 1 s / 2 s delays and immediately failing over on `503` overload responses.
   </Card>
 </CardGroup>

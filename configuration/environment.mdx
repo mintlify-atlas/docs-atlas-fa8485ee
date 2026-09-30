@@ -1,7 +1,7 @@
 ---
-title: "Environment Variables & Configuration Reference"
+title: "AutoFix Environment Variables & Configuration Reference"
 sidebarTitle: "Environment"
-description: "Complete reference for every environment variable AutoFix reads from .env via Pydantic BaseSettings, including types, defaults, and configuration guidance."
+description: "Reference for every env var AutoFix reads from .env via Pydantic BaseSettings — field names, types, defaults, and configuration guidance."
 ---
 
 AutoFix loads all configuration at startup through a Pydantic `BaseSettings` class defined in `app/core/config.py`. Variables are read from a `.env` file at the project root (or from the shell environment directly), making it straightforward to run AutoFix locally, in Docker, or on any cloud platform without changing application code.

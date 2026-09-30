@@ -1,7 +1,7 @@
 ---
-title: "GitHub App Setup & Webhook Integration Guide"
+title: "AutoFix GitHub App Setup and Webhook Integration Guide"
 sidebarTitle: "GitHub App"
-description: "Register a GitHub App, configure permissions, wire up webhook signature verification, and understand how AutoFix authenticates with RS256 JWT to heal pull requests."
+description: "Register a GitHub App, configure permissions, set up RS256 JWT auth, and enable HMAC-SHA256 webhook signature verification for pull request healing."
 ---
 
 AutoFix's GitHub integration works as a **GitHub App** — a first-class GitHub identity with fine-grained repository permissions, installation-scoped access tokens, and verified webhook delivery. When a pull request is opened or updated, GitHub sends a signed webhook event to AutoFix, which then clones the branch, runs the healing pipeline, commits any patches, and posts a structured audit report as a PR comment — all without storing long-lived OAuth tokens.
@@ -149,7 +149,7 @@ A GitHub App must be **installed** on a repository before it can access that rep
 
 When AutoFix needs to act on a repository (clone it, commit patches, or post comments), it first exchanges its private key for a short-lived **installation access token** via GitHub's App authentication flow.
 
-```
+```text
 ┌──────────┐    RS256 JWT (10 min)    ┌──────────────────────────────────────┐
 │ AutoFix  │ ───────────────────────► │  POST /app/installations/{id}/       │
 │  Server  │                          │            access_tokens             │
@@ -163,7 +163,7 @@ The JWT payload contains three claims:
 
 | Claim | Value | Purpose |
 |---|---|---|
-| `iss` | `GITHUB_APP_ID` | Identifies the GitHub App |
+| `iss` | `str(GITHUB_APP_ID)` | Identifies the GitHub App (cast to string) |
 | `iat` | `now` (Unix epoch) | Issued-at timestamp |
 | `exp` | `now + 600` | Expires in 10 minutes |
 

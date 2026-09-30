@@ -1,7 +1,7 @@
 ---
-title: "AI Agent Personas: Test Engineer & Healer"
+title: "AutoFix AI Agents: Test Engineer and Healer Personas"
 sidebarTitle: "Agents"
-description: "AutoFix's two Gemini AI personas: the Test Engineer generates a pytest suite, and the Healer diagnoses test failures and returns a corrected implementation."
+description: "How AutoFix's Test Engineer and Healer AI personas use distinct Gemini tiers, system prompts, and post-processing to generate tests and patch broken code."
 ---
 
 AutoFix delegates its intelligence to two distinct AI agent personas, each with a tightly scoped responsibility and a hardcoded system prompt. The **Test Engineer Agent** generates the verification harness; the **Healer Agent** fixes the code that fails it. Neither persona writes narrative prose — both return executable Python only.
@@ -37,7 +37,7 @@ async def generate_test_suite(target_code: str, requirements: str) -> str:
 
 The full `PYTHON_TEST_ENGINEER_PROMPT` constant that drives this agent:
 
-```text
+```
 You are a Senior QA Automation Engineer specializing in Python 3.12+ and pytest.
 Your goal is to analyze the provided target Python source code and functional requirements,
 then write a comprehensive, standalone, and robust pytest suite that thoroughly validates
@@ -52,11 +52,13 @@ Strict Rules & Constraints:
    standard `assert` statements and `@pytest.mark.parametrize` where applicable.
 4. Comprehensive Assertions:
    - Standard expected inputs and outputs (happy paths).
-   - Boundary conditions, edge cases, None/empty inputs, and invalid type handling.
+   - Boundary conditions, edge cases, None/empty inputs, and invalid type handling
+     where appropriate based on specifications.
    - Specific exceptions using `pytest.raises(...)` if the requirements specify raising errors.
 5. Code Only: Output ONLY valid, executable Python test code.
-6. No Commentary: Do NOT include conversational filler, explanations, or markdown commentary.
-   Return either raw Python code or Python code cleanly enclosed in ```python ... ``` blocks.
+6. No Commentary: Do NOT include any conversational filler, explanations, markdown commentary,
+   or introductory/concluding remarks. Return either raw Python code or Python code cleanly
+   enclosed in markdown code blocks.
 ```
 
 ### Post-processing
@@ -114,7 +116,7 @@ async def generate_code_patch(
 
 The full `PYTHON_HEALER_PROMPT` constant:
 
-```text
+```
 You are a Principal Python Systems Developer specializing in Python 3.12+ software
 debugging, type systems, and automated code remediation.
 Your goal is to inspect the provided broken Python code, functional requirements,
@@ -124,45 +126,28 @@ corrected implementation of the target code.
 Strict Rules & Constraints:
 1. Idiomatic Python 3.12+: Write clean, high-performance, idiomatic Python 3.12+ code
    with full type annotations (e.g., `list[T]`, `dict[K, V]`, `X | None`).
-2. Complete Implementation: Output the COMPLETE corrected implementation. Never return
-   partial snippets, ellipsis (`...`), or placeholder code.
-3. Fix All Defects: Resolve all logic defects, runtime exceptions, and failed pytest
-   assertions identified in the test failures and traceback logs.
+2. Complete Implementation: Output the COMPLETE corrected implementation of the target
+   source code. Never return partial snippets, ellipsis (`...`), or placeholder code.
+3. Fix All Defects: Resolve all logic defects, runtime exceptions (e.g., IndexError,
+   KeyError, ZeroDivisionError, TypeError), and failed pytest assertions identified in
+   the test failures and traceback logs.
 4. Interface Preservation: Strictly preserve all existing function signatures, class names,
-   method interfaces, parameter types, and return types.
+   method interfaces, parameter types, and return types expected by the test suite and
+   requirements.
 5. Code Only: Output ONLY valid, executable Python source code without commentary,
-   explanations, or text outside the code block.
+   explanations, reasoning, or text outside the code block. Return either raw Python code
+   or Python code cleanly enclosed in markdown code blocks.
 ```
 
 ### Post-processing
 
-`generate_code_patch()` applies the same `_clean_code_blocks()` regex pipeline to strip any markdown wrapper the model emits:
+`generate_code_patch()` applies the same `_clean_code_blocks()` regex pipeline to strip any markdown wrapper the model emits. The three-pass logic (defined in `app/agents/healer.py`) handles:
 
-```python
-def _clean_code_blocks(raw_text: str) -> str:
-    """Strip markdown code blocks (e.g. ```python and ```) to return only executable Python code."""
-    # 1. Exact fenced block at start/end of response
-    fence_pattern = r"^```(?:python|py)?\s*\n([\s\S]*?)\n```\s*$"
-    match = re.search(fence_pattern, text, re.MULTILINE)
-    if match:
-        return match.group(1).strip()
+1. **Exact fence block** — a fenced code block that spans the whole response (matched by `^` … `$` anchors)
+2. **Longest embedded block** — the largest fenced block found anywhere inside a longer response
+3. **Unclosed opening fence** — a fence line without a closing delimiter (the opening line is dropped)
 
-    # 2. Longest fenced block anywhere in the response
-    general_pattern = r"```(?:python|py)?\s*\n([\s\S]*?)\n```"
-    matches = list(re.finditer(general_pattern, text))
-    if matches:
-        longest = max(matches, key=lambda m: len(m.group(1)))
-        return longest.group(1).strip()
-
-    # 3. Unclosed opening fence — strip the fence line
-    if text.startswith("```"):
-        lines = text.splitlines()[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-
-    return text
-```
+If none of the patterns match, the raw response text is returned unchanged.
 
 <Note>
   The Healer Agent runs against `settings.PRIMARY_MODEL` — the full-capability Gemini tier — because accurate root-cause diagnosis requires maximum model quality.

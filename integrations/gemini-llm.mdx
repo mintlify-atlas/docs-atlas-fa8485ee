@@ -1,7 +1,7 @@
 ---
 title: "Google Gemini LLM Integration: Multi-Model Tiering"
 sidebarTitle: "Gemini LLM"
-description: "How AutoFix calls Google Gemini with async multi-model fallback chains, transient-error retries, 503 fast-fail, and markdown fence stripping for clean agent output."
+description: "AutoFix calls Google Gemini via multi-model fallback chains, per-model backoff retries, 503 overload skips, and fence stripping for clean agent output."
 ---
 
 AutoFix uses Google Gemini as the AI backbone for both the Test Engineer and Healer agents. Rather than hard-wiring a single model, the client implements a **multi-model tiering strategy**: every call starts with a primary model and automatically falls through an ordered list of fallback candidates when the primary is rate-limited, overloaded, or returns a non-retryable error. This page documents the `call_gemini()` function, the retry and fallback logic, the singleton client, and the model configuration that drives all of this.
@@ -86,7 +86,7 @@ candidate_models = [primary] + [m for m in FALLBACK_MODELS if m != primary]
 
 For a default configuration this expands to:
 
-```
+```text
 1. gemini-3.6-flash       ← PRIMARY_MODEL
 2. gemini-3.5-flash       ← FALLBACK_MODELS[0]
 3. gemini-3.5-flash-lite  ← FALLBACK_MODELS[1]

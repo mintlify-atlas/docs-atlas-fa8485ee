@@ -86,7 +86,7 @@ It uses two regex patterns to handle both pytest output orderings (`test::name S
 
 ```python
 patterns = [
-    r"([\w/\.\-]+::\w+(?:\[[^\]]+\])?)\\s+(PASSED|FAILED|ERROR)",
+    r"([\w/\.\-]+::\w+(?:\[[^\]]+\])?)\s+(PASSED|FAILED|ERROR)",
     r"(FAILED|PASSED|ERROR)\s+([\w/\.\-]+::\w+(?:\[[^\]]+\])?)",
 ]
 ```

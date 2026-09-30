@@ -146,10 +146,9 @@ if result:
 
 Lazy singleton initialiser for the `genai.Client`. The client is created once per process and cached in the module-level `_client` variable. Reads the API key from (in priority order):
 
-1. `settings.GOOGLE_API_KEY`
-2. `settings.GEMINI_API_KEY`
-3. `os.environ["GOOGLE_API_KEY"]`
-4. `os.environ["GEMINI_API_KEY"]`
+1. `settings.GOOGLE_API_KEY` (declared in `Settings`, loaded from `.env`)
+2. `os.environ.get("GOOGLE_API_KEY")` (raw environment variable)
+3. `os.environ.get("GEMINI_API_KEY")` (alternative env variable name)
 
 ```python
 def get_client() -> genai.Client

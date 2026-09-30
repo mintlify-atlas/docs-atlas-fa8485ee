@@ -203,26 +203,49 @@ async def post_pr_comment(
   Pull request (or issue) number.
 </ParamField>
 
-<ParamField path="comment_markdown" type="str | HealResponse | None" default="None">
-  Either a rendered Markdown string to post directly, or a `HealResponse` object whose `audit_report` field (or auto-rendered report) will be used.
+<ParamField path="comment_markdown" type="Any" default="None">
+  Positional argument. Pass either a pre-rendered Markdown string or a `HealResponse` / dict object. When a non-string object is provided, `build_healing_audit_report()` is called automatically to render the report body.
 </ParamField>
 
 <ParamField path="token" type="str" default="">
   GitHub installation access token with `pull_requests: write` permission.
 </ParamField>
 
+<ParamField path="comment_or_metadata" type="Any" default="None">
+  Keyword-only alternative to `comment_markdown` (after the bare `*` separator). Takes priority over `comment_markdown` when not `None`. Accepts the same types: a Markdown string, a `HealResponse`, or any dict-like metadata object.
+</ParamField>
+
 **Returns:** `bool` — `True` on `HTTP 201 Created`, `False` otherwise.
 
 ---
 
-### `format_pr_comment()`
+### `build_healing_audit_report()` (static method)
+
+Thin static method wrapper around the module-level `build_healing_audit_report()` function. Accepts the same arguments and returns the same value. Provided so callers that hold a `GitHubService` instance can build audit reports without an additional import.
+
+```python
+@staticmethod
+def build_healing_audit_report(heal_response=None, **kwargs) -> str
+```
+
+See the [module-level `build_healing_audit_report()`](#build_healing_audit_report) section below for the full parameter reference.
+
+---
+
+### `format_pr_comment()` (static method)
 
 Static method. Returns the pre-rendered `audit_report` string from a `HealResponse`, falling back to calling `build_healing_audit_report()` if the field is empty.
 
 ```python
 @staticmethod
-def format_pr_comment(heal_response: HealResponse) -> str
+def format_pr_comment(heal_response) -> str
 ```
+
+<ParamField path="heal_response" type="HealResponse | None">
+  A `HealResponse` object from the healing pipeline. If `heal_response.audit_report` is non-empty it is returned directly; otherwise `build_healing_audit_report(heal_response)` is called to render a fresh report.
+</ParamField>
+
+**Returns:** `str` — a complete Markdown audit report string ready for posting.
 
 ---
 

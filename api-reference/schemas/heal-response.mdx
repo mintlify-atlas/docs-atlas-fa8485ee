@@ -30,15 +30,15 @@ description: "AutoFix healing pipeline output: healed code, file patches, struct
   Target programming language — mirrors the value from `HealRequest`.
 </ResponseField>
 
-<ResponseField name="failing_file" type="string">
+<ResponseField name="failing_file" type="string" default='""'>
   Relative path to the source file that was targeted for healing (e.g. `compound_interest.py`). Matches the `file_path` from the request, defaulting to `target.py`.
 </ResponseField>
 
-<ResponseField name="test_target" type="string">
+<ResponseField name="test_target" type="string" default='""'>
   Relative path to the generated test file that was executed in the sandbox (e.g. `test_target.py` or `tests/test_compound_interest.py`).
 </ResponseField>
 
-<ResponseField name="ast_dependencies" type="array of strings">
+<ResponseField name="ast_dependencies" type="array of strings" default="[]">
   List of source file paths that the AST analyzer identified as interdependent with the failing file. For single-file healing this is always `[source_file, test_filename]`. For repository-level healing it reflects the full dependency graph.
 </ResponseField>
 
@@ -48,7 +48,7 @@ description: "AutoFix healing pipeline output: healed code, file patches, struct
   List of `FilePatch` objects representing each file that was changed during the healing run. A patch is only appended when `final_code != original buggy_code`. See [FilePatch schema](/api-reference/schemas/file-patch) for field details.
 </ResponseField>
 
-<ResponseField name="patched_code" type="string">
+<ResponseField name="patched_code" type="string" default='""'>
   Convenience alias: the `patched_content` from the first entry in `patches`, or an empty string if no patch was applied. Auto-populated by `model_post_init` when `patches` is non-empty.
 </ResponseField>
 
@@ -56,11 +56,11 @@ description: "AutoFix healing pipeline output: healed code, file patches, struct
   Alias for `iterations_used`. Both fields are kept in sync by `model_post_init`; prefer `iterations_used` in new integrations.
 </ResponseField>
 
-<ResponseField name="model_name" type="string">
+<ResponseField name="model_name" type="string" default='""'>
   Name of the Gemini model used for both the Test Engineer and Healer agents (e.g. `"gemini-3.6-flash"`). Mirrors `settings.PRIMARY_MODEL`.
 </ResponseField>
 
-<ResponseField name="model_used" type="string">
+<ResponseField name="model_used" type="string" default='""'>
   Alias for `model_name`. Both fields are kept in sync by `model_post_init`.
 </ResponseField>
 
@@ -74,11 +74,11 @@ description: "AutoFix healing pipeline output: healed code, file patches, struct
   Chronological list of `LogEntry` objects emitted at every pipeline step. Useful for debugging, observability dashboards, and building audit trails. See [LogEntry schema](/api-reference/schemas/log-entry) for field details.
 </ResponseField>
 
-<ResponseField name="failure_logs" type="string">
+<ResponseField name="failure_logs" type="string" default='""'>
   The raw `pytest` stdout/stderr captured during the **first** failing sandbox run. This is the original traceback before any Healer agent intervention.
 </ResponseField>
 
-<ResponseField name="audit_report" type="string">
+<ResponseField name="audit_report" type="string" default='""'>
   A pre-rendered Markdown string containing the full healing audit report — iteration count, model, AST dependencies, per-test before/after status table, and the final patched code. Identical to the content posted as a GitHub PR comment by the GitHub App integration.
 </ResponseField>
 

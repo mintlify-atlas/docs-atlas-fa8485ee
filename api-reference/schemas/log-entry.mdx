@@ -178,6 +178,26 @@ The tables below list every `step_name` value currently emitted by the orchestra
     ```
   </Accordion>
 
+  <Accordion title="TESTS_PASSED (repo)">
+    **Emitted:** When `sandbox.run_tests()` returns `passed=True` during repository healing.
+
+    The same `TESTS_PASSED` step name is shared with the single-file pipeline.
+
+    ```
+    "Repository tests passed on iteration 1!\n..."
+    ```
+  </Accordion>
+
+  <Accordion title="TESTS_FAILED (repo)">
+    **Emitted:** When `sandbox.run_tests()` returns `passed=False` during repository healing.
+
+    The same `TESTS_FAILED` step name is shared with the single-file pipeline. The `message` contains the full pytest stdout/stderr.
+
+    ```
+    "Repository tests failed on iteration 1/3:\n..."
+    ```
+  </Accordion>
+
   <Accordion title="REPO_PIPELINE_COMPLETE">
     **Emitted:** At the very end of `run_repo_healing_pipeline`, after sandbox cleanup.
 
@@ -188,7 +208,7 @@ The tables below list every `step_name` value currently emitted by the orchestra
 </AccordionGroup>
 
 <Note>
-  The `ERROR` step name is shared between both pipelines and can appear at any point where an unhandled exception is caught. Always check for `ERROR` entries before assuming `success: false` means the pipeline ran all iterations.
+  The `ERROR`, `TESTS_PASSED`, and `TESTS_FAILED` step names are shared between both pipelines. Always check for `ERROR` entries before assuming `success: false` means the pipeline ran all iterations.
 </Note>
 
 ## Example LogEntry

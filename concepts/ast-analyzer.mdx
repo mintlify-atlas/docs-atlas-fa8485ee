@@ -18,6 +18,19 @@ class RepoAnalyzer:
 
 `RepoAnalyzer` has no constructor arguments and holds no state — each method call is independent. All three public methods are designed to be composed in sequence: `scan_python_dependencies()` feeds into `build_dependency_graph()`, which feeds into `extract_relevant_context()`.
 
+### Class Constant: `LANGUAGE_EXTENSIONS`
+
+The class exposes a mapping of language identifiers to recognised file extensions. Currently only Python is supported:
+
+```python
+LANGUAGE_EXTENSIONS = {
+    "python": [".py"],
+    "py": [".py"],
+}
+```
+
+Both `"python"` and `"py"` are accepted as the `language` argument in `build_dependency_graph()` and `extract_relevant_context()`, and both map to the same `.py` extension set.
+
 ---
 
 ## `scan_python_dependencies()`

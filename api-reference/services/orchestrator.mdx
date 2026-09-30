@@ -325,3 +325,27 @@ print(clean_code_fences(raw))
 <ResponseField name="model_used" type="str">
   The Gemini model name that was ultimately used (may differ from `PRIMARY_MODEL` if a fallback was triggered).
 </ResponseField>
+
+<ResponseField name="model_name" type="str">
+  Alias for `model_used`. Both fields are kept in sync by `HealResponse.model_post_init`.
+</ResponseField>
+
+<ResponseField name="language" type="str">
+  Target programming language of the healed file. Always `"python"` in the current implementation.
+</ResponseField>
+
+<ResponseField name="failing_file" type="str">
+  The source filename that was targeted for repair (e.g. `"target.py"` or `"app/utils/parser.py"`).
+</ResponseField>
+
+<ResponseField name="test_target" type="str">
+  Repo-relative path of the test file that was used to verify the patch (e.g. `"test_target.py"` or `"tests/test_parser.py"`).
+</ResponseField>
+
+<ResponseField name="max_iterations" type="int">
+  The maximum number of heal-and-retest cycles allowed, taken from `settings.MAX_HEALING_ITERATIONS`.
+</ResponseField>
+
+<ResponseField name="iterations" type="int">
+  Total heal cycles executed. Kept in sync with `iterations_used` by `HealResponse.model_post_init`.
+</ResponseField>
